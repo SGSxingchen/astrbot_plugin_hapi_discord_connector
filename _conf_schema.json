@@ -1,0 +1,93 @@
+{
+  "hapi_endpoint": {
+    "description": "HAPI 服务地址",
+    "type": "string",
+    "default": "",
+    "hint": "例如: http://localhost:3006"
+  },
+  "access_token": {
+    "description": "HAPI Access Token (支持 token:namespace 格式)",
+    "type": "string",
+    "default": ""
+  },
+  "proxy_url": {
+    "description": "代理地址 (支持 socks5h:// 和 http://)",
+    "type": "string",
+    "default": "",
+    "hint": "例如: socks5h://127.0.0.1:1080 或 http://127.0.0.1:7890"
+  },
+  "cf_access_client_id": {
+    "description": "Cloudflare Zero Trust Access Client ID（留空则不启用 CF 认证）",
+    "type": "string",
+    "default": "",
+    "hint": "部署在 Cloudflare Access 后面时需要填写，可在 Zero Trust 控制台创建 Service Token 获取"
+  },
+  "cf_access_client_secret": {
+    "description": "Cloudflare Zero Trust Access Client Secret",
+    "type": "string",
+    "default": "",
+    "hint": "与 Client ID 配对使用"
+  },
+  "max_reconnect_attempts": {
+    "description": "SSE 最大重连次数（0 表示无限重连）",
+    "type": "int",
+    "default": 10,
+    "hint": "达到上限后停止自动重连，节约资源。打开 /dhapi 面板可重新唤醒"
+  },
+  "jwt_lifetime": {
+    "description": "JWT 有效期 (秒)",
+    "type": "int",
+    "default": 900
+  },
+  "refresh_before_expiry": {
+    "description": "JWT 提前刷新时间 (秒)",
+    "type": "int",
+    "default": 180
+  },
+  "output_level": {
+    "description": "SSE 推送级别",
+    "type": "string",
+    "default": "simple",
+    "options": [
+      "silence",
+      "simple",
+      "summary",
+      "detail"
+    ],
+    "hint": "silence: 仅推送权限请求；simple: 推送纯文本消息及系统事件；summary: 任务完成时推送最近 N 条消息；detail: 实时推送所有消息"
+  },
+  "summary_msg_count": {
+    "description": "summary 推送级别显示的 agent 消息条数",
+    "type": "int",
+    "default": 5
+  },
+  "remind_pending": {
+    "description": "待审批请求超时重复提醒",
+    "type": "bool",
+    "default": true,
+    "hint": "防止 AI 会话缓存失效"
+  },
+  "remind_interval": {
+    "description": "待审批重复提醒间隔（秒）",
+    "type": "int",
+    "default": 180
+  },
+  "auto_approve_enabled": {
+    "description": "自动审批：开启后 24 小时自动批准所有非 question 权限请求（默认关闭）",
+    "type": "bool",
+    "default": false,
+    "hint": "⚠️ 请谨慎开启，启用后 AI 将无需确认自动执行非 question 权限请求"
+  },
+  "embed_enabled": {
+    "description": "Discord Embed 推送",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后通知和帮助页优先使用 Discord Embed；关闭则退化为纯文本"
+  },
+  "embed_brand_color": {
+    "description": "Discord Embed 品牌色（十六进制整数）",
+    "type": "int",
+    "default": 5793266,
+    "hint": "默认 0x5865F2（Discord 紫蓝）"
+  }
+}

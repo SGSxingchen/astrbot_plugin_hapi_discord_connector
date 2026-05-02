@@ -1,0 +1,14 @@
+name: astrbot_plugin_hapi_discord_connector
+display_name: HAPI Discord Connector
+desc: "HAPI 远程 vibe coding 的 Discord 专用版：/dhapi 一键打开原生 Embed + Button + Select 控制面板。"
+version: v1.0.0
+author: SGSxingchen
+repo: https://github.com/SGSxingchen/astrbot_plugin_hapi_discord_connector
+keywords:
+  - vibe coding
+  - discord
+  - claudecode
+  - codex
+  - geminicli
+  - opencode
+  - hapi
