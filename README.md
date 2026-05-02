@@ -129,7 +129,7 @@ _✨ HAPI 远程 vibe coding 的 Discord 专用版 ✨_
 
 LLM 工具审批通知会优先发送 Discord Embed，并附带原生 `discord.ui.View` 按钮（批准、拒绝、打开/刷新审批面板），不是只提示用户打开 `/dhapi`。插件层提供本地兼容组件与发送补丁，避免 AstrBot DiscordEmbed 包装类在热重载或字段定义不一致时导致 `no field "title"`。
 
-如果 Embed 发送失败，插件会降级发送普通文本提示，并保留 pending request，可继续在 `/dhapi` 审批面板中处理；当 `auto_approve_enabled=true` 时，通知失败不会导致拒绝，而是继续自动批准。
+如果 LLM 工具审批的 `Embed + 按钮` 发送失败，插件会先尝试 `Embed-only`，再按 `auto_approve_enabled` 决定是否自动批准或保留 pending 供 `/dhapi` 面板处理。SSE 通知侧不会再在 Embed 失败后追加纯文本降级，以避免同一事件出现 Embed + 文本双推；失败原因会记录到日志。
 
 ---
 
