@@ -33,6 +33,10 @@ class LLMIntegration:
             logger.debug("[LLM工具] 非管理员，已移除所有工具")
             return
 
+        # LLM 工具也视为当前 Discord 窗口的活跃入口：确保外部 REST
+        # 创建的无 owner session 后续可以稳定 fallback 到这个默认窗口。
+        await self.state_mgr.ensure_primary_session(event)
+
         # 2. 上下文检查：窗口无可见 session 时只保留基础工具
         visible_sessions = self.state_mgr.visible_sessions_for_window(
             event, self.sessions_cache
@@ -103,6 +107,7 @@ class LLMIntegration:
         """
         # LLM 工具审批使用窗口 ID 作为 key，而不是 session ID
         window_id = event.unified_msg_origin
+        await self.state_mgr.ensure_primary_session(event)
 
         # 添加到 pending 队列（伪装成 HAPI 权限请求）
         req_id, future, index = self.pending_mgr.add_llm_tool_request(
@@ -134,10 +139,11 @@ class LLMIntegration:
 当前总共 {total} 个待审批，当前对话窗口共 {window_total} 个待审批，此请求审批序号 {index}
 
 审批方式:
-  打开 /dhapi → 审批 面板处理
-  打开 /dhapi 面板查看完整列表"""
+  直接点击下方按钮批准/拒绝
+  或打开 /dhapi → 审批 面板处理"""
 
         notification_sent = False
+        embed = None
         try:
             fields = [
                 {"name": "工具", "value": f"`{tool_name}`", "inline": True},
@@ -145,7 +151,7 @@ class LLMIntegration:
                 {"name": "参数", "value": args_str[:1024] or "-", "inline": False},
                 {
                     "name": "审批方式",
-                    "value": "打开 `/dhapi` → `审批` 面板处理",
+                    "value": "直接点击下方按钮批准/拒绝，或打开 `/dhapi` → `审批` 面板处理",
                     "inline": False,
                 },
             ]
@@ -156,10 +162,25 @@ class LLMIntegration:
                 fields=fields,
                 footer="LLM tool approval | HAPI Discord Connector",
             )
-            await event.send(MessageChain([embed]))
+            from .discord_ui import ApprovalNoticeView
+            from .notification_manager import make_view_component
+
+            view = ApprovalNoticeView(self.plugin, event, window_id, req_id)
+            await event.send(MessageChain([embed, make_view_component(view)]))
             notification_sent = True
         except Exception as e:
-            logger.warning(f"LLM 工具审批 Embed 通知发送失败，尝试纯文本降级: {e}")
+            logger.warning(
+                f"LLM 工具审批 Embed+按钮通知发送失败，尝试 Embed-only 降级: {e}"
+            )
+            if embed is not None:
+                try:
+                    await event.send(MessageChain([embed]))
+                    notification_sent = True
+                except Exception as embed_exc:
+                    logger.warning(
+                        f"LLM 工具审批 Embed-only 通知发送失败，尝试纯文本降级: {embed_exc}"
+                    )
+        if not notification_sent:
             try:
                 await event.send(MessageChain().message(msg))
                 notification_sent = True

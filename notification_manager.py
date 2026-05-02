@@ -57,6 +57,18 @@ class _DhapiDiscordEmbed(BaseMessageComponent):
         return _component_to_discord_embed(self)
 
 
+class _DhapiDiscordViewComponent(BaseMessageComponent):
+    """Plugin-local wrapper for native discord.ui.View in MessageChain."""
+
+    type: str = "discord_view"
+    view: Any = None
+
+
+def make_view_component(view: discord.ui.View) -> _DhapiDiscordViewComponent:
+    """Wrap a native Discord View so AstrBot's event.send can carry it."""
+    return _DhapiDiscordViewComponent(view=view)
+
+
 def _component_to_discord_embed(comp) -> discord.Embed:
     """Convert any DHAPI/AstrBot duck-typed embed component to discord.Embed."""
     embed = discord.Embed()
@@ -92,6 +104,14 @@ def _is_nonempty_discord_embed_component(comp) -> bool:
         or getattr(comp, "fields", None)
         or getattr(comp, "image", None)
         or getattr(comp, "thumbnail", None)
+    )
+
+
+def _is_nonempty_discord_view_component(comp) -> bool:
+    """Duck-type Discord view validity for AstrBot respond stage."""
+    return isinstance(comp, discord.ui.View) or (
+        getattr(comp, "type", None) == "discord_view"
+        and isinstance(getattr(comp, "view", None), discord.ui.View)
     )
 
 
@@ -149,7 +169,9 @@ def apply_discord_embed_compat_patches() -> None:
 
         async def patched_empty_check(self, chain):
             for comp in chain or []:
-                if _is_nonempty_discord_embed_component(comp):
+                if _is_nonempty_discord_embed_component(
+                    comp
+                ) or _is_nonempty_discord_view_component(comp):
                     return False
             return await original_empty_check(self, chain)
 
@@ -176,12 +198,19 @@ def apply_discord_embed_compat_patches() -> None:
 
         async def patched_parse_to_discord(self, message):
             dhapi_embeds = []
+            dhapi_view = None
             original_chain = message.chain
             try:
                 filtered_chain = []
                 for comp in original_chain or []:
                     if getattr(comp, "type", None) == "discord_embed":
                         dhapi_embeds.append(_component_to_discord_embed(comp))
+                    elif isinstance(comp, discord.ui.View):
+                        dhapi_view = comp
+                    elif getattr(comp, "type", None) == "discord_view" and isinstance(
+                        getattr(comp, "view", None), discord.ui.View
+                    ):
+                        dhapi_view = getattr(comp, "view")
                     else:
                         filtered_chain.append(comp)
 
@@ -197,6 +226,8 @@ def apply_discord_embed_compat_patches() -> None:
                     reference_message_id,
                 ) = await original_parse(self, message)
                 embeds.extend(dhapi_embeds)
+                if dhapi_view is not None:
+                    view = dhapi_view
                 return content, files, view, embeds, reference_message_id
             finally:
                 message.chain = original_chain
@@ -225,9 +256,14 @@ class NotificationManager:
 
     MAX_LEN = 1900
 
-    def __init__(self, context, state_mgr):
+    def __init__(self, context, state_mgr, plugin=None):
         self.context = context
         self.state_mgr = state_mgr
+        # `plugin` is optional for compatibility with older construction sites.
+        # In this plugin StateManager.kv is the Star instance, so use it as a
+        # fallback.  Approval notification buttons need access to pending_mgr and
+        # session_ops through the plugin object.
+        self.plugin = plugin or getattr(state_mgr, "kv", None)
         self._recent_notifications: dict[tuple[str, str, str], float] = {}
 
     @staticmethod
@@ -249,12 +285,12 @@ class NotificationManager:
         return "待审批" in text
 
     def should_skip_duplicate(self, umo: str, session_id: str, text: str) -> bool:
-        if self.is_request_notification(text):
-            return False
-
         now = time.monotonic()
-        dedupe_window = 2.5
-        expire_before = now - 30
+        # SSE can emit several adjacent state/message/request events for the
+        # same logical change.  Dedupe all notification kinds; approval notices
+        # are keyed by their body/index so distinct pending items still pass.
+        dedupe_window = 8.0 if self.is_request_notification(text) else 3.5
+        expire_before = now - 60
         for key, ts in list(self._recent_notifications.items()):
             if ts < expire_before:
                 self._recent_notifications.pop(key, None)
@@ -416,11 +452,71 @@ class NotificationManager:
         fields.append(
             {
                 "name": "审批方式",
-                "value": "打开 `/dhapi` → `审批` 面板处理",
+                "value": "直接点击下方按钮批准/拒绝，或打开 `/dhapi` → `审批` 面板处理",
                 "inline": False,
             }
         )
         return fields
+
+    @staticmethod
+    def _extract_approval_index(text: str) -> int | None:
+        m = re.search(r"审批序号\s*(\d+)", text or "")
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _fake_event_for_umo(umo: str):
+        """Create the tiny event surface Discord views need for SSE notices."""
+
+        class _NoticeEvent:
+            unified_msg_origin = umo
+            session_id = ""
+
+            @staticmethod
+            def get_sender_id():
+                return ""
+
+        return _NoticeEvent()
+
+    def _approval_notice_view(self, umo: str, session_id: str, text: str):
+        """Return a native View for the pending item referenced by this notice.
+
+        HAPI SSE approval notices include a stable "审批序号"; LLM tool notices
+        already create their own view in llm_integration.  For HAPI permission
+        and compact requests we attach buttons to the exact pending sid/rid so
+        callbacks reuse ApprovalView._approve_item/_deny_item.
+        """
+        plugin = self.plugin
+        if not plugin or not session_id:
+            return None
+        try:
+            pending = plugin.sse_listener.pending.get(session_id, {})
+            if not pending:
+                return None
+            wanted_index = self._extract_approval_index(text)
+            rid = None
+            if wanted_index is not None:
+                for candidate_rid, req in pending.items():
+                    if int((req or {}).get("index") or 0) == wanted_index:
+                        rid = candidate_rid
+                        break
+            if rid is None and len(pending) == 1:
+                rid = next(iter(pending.keys()))
+            if rid is None:
+                return None
+
+            from .discord_ui import ApprovalNoticeView
+
+            return ApprovalNoticeView(
+                plugin, self._fake_event_for_umo(umo), session_id, rid
+            )
+        except Exception as exc:
+            logger.warning("构建审批通知按钮失败 sid=%s: %s", session_id[:8], exc)
+            return None
 
     def make_embed(
         self,
@@ -479,6 +575,7 @@ class NotificationManager:
         color: int,
         fields: list[dict] | None = None,
         footer: str | None = None,
+        view: discord.ui.View | None = None,
     ):
         """向 Discord 目标窗口推送一个或多个 Embed。"""
         chunks = self.split_message(description, self.MAX_LEN)
@@ -497,7 +594,10 @@ class NotificationManager:
                     idx,
                     len(chunks),
                 )
-                await self.context.send_message(umo, MessageChain([embed]))
+                chain_items = [embed]
+                if view is not None and idx == 1:
+                    chain_items.append(make_view_component(view))
+                await self.context.send_message(umo, MessageChain(chain_items))
                 logger.info(
                     "[dhapi] push_embed sent umo=%s title=%s", umo, page_title[:80]
                 )
@@ -549,11 +649,47 @@ class NotificationManager:
             if self.should_skip_duplicate(umo, session_id, text):
                 continue
             if self._embed_enabled():
+                view = (
+                    self._approval_notice_view(umo, session_id, text)
+                    if kind == "approval"
+                    else None
+                )
                 try:
-                    await self.push_embed(umo, title, text, color, fields, footer)
+                    await self.push_embed(umo, title, text, color, fields, footer, view)
                     continue
-                except Exception:
-                    logger.warning("Embed 推送失败，尝试纯文本降级 (umo=%s)", umo[:20])
+                except Exception as exc:
+                    if view is not None:
+                        logger.error(
+                            "Embed+按钮推送失败，尝试 Embed-only 降级 (umo=%s): %s",
+                            umo[:20],
+                            exc,
+                            exc_info=True,
+                        )
+                        try:
+                            await self.push_embed(
+                                umo, title, text, color, fields, footer, None
+                            )
+                            continue
+                        except Exception as embed_only_exc:
+                            logger.error(
+                                "Embed-only 降级仍失败，跳过纯文本以避免重复推送 (umo=%s): %s",
+                                umo[:20],
+                                embed_only_exc,
+                                exc_info=True,
+                            )
+                            continue
+                    logger.error(
+                        "Discord Embed 推送失败，跳过纯文本降级以避免 Embed+文本双推 (umo=%s): %s",
+                        umo[:20],
+                        exc,
+                        exc_info=True,
+                    )
+                    continue
+            logger.warning(
+                "embed_enabled=false，使用纯文本推送 (umo=%s sid=%s)",
+                umo[:20],
+                session_id[:8] if session_id else "global",
+            )
             for chunk in self.split_message(text, self.MAX_LEN):
                 try:
                     logger.info(

@@ -15,6 +15,11 @@ class StateManager:
         self.kv = kv_helper
         self.binding_mgr = binding_mgr
         self._user_states_cache: dict[str, dict] = {}
+        # Persisted, user-independent index of known notification windows.
+        # This keeps fallback routing stable even if dhapi_known_users is missing
+        # or a plugin reload happens before a user opens /dhapi again.
+        self._primary_windows_cache: list[str] = []
+        self._flavor_primary_windows_cache: dict[str, list[str]] = {}
         self._session_owners = binding_mgr._session_owners
 
     # ──── 持久化 ────
@@ -74,6 +79,7 @@ class StateManager:
             state.update(kwargs)
             self._user_states_cache[sender_id] = state
             await self.kv.put_kv_data(f"dhapi_user_state_{sender_id}", state)
+            await self.persist_notification_windows_index()
         elif sender_id not in self._user_states_cache:
             self._user_states_cache[sender_id] = state
 
@@ -101,11 +107,21 @@ class StateManager:
     async def set_primary_window(self, event: AstrMessageEvent, umo: str | None = None):
         """显式设置当前用户的主通知窗口。"""
         target_umo = umo or event.unified_msg_origin
+        # Capture the user's currently effective session before changing the
+        # primary window.  This makes "设为主通知窗口" take effect immediately
+        # for the session the user is managing from their previous/default
+        # window, instead of letting an old session_owner keep stealing routes.
+        effective_sid = self.effective_sid(event)
+        effective_flavor = self.effective_flavor(event) or "unknown"
         await self.set_user_state(event, primary_umo=target_umo)
+        if effective_sid:
+            await self.capture_window(effective_sid, target_umo, effective_flavor)
         logger.info(
-            "[dhapi] set_primary_window user=%s umo=%s",
+            "[dhapi] set_primary_window user=%s umo=%s captured_sid=%s flavor=%s",
             event.get_sender_id(),
             target_umo,
+            effective_sid[:8] if effective_sid else "",
+            effective_flavor,
         )
 
     # ──── 状态查询 ────
@@ -209,6 +225,46 @@ class StateManager:
 
     # ──── 路由管理 ────
 
+    @staticmethod
+    def _append_unique(targets: list[str], seen: set[str], umo: str | None):
+        target_umo = str(umo).strip() if umo is not None else ""
+        if target_umo and target_umo not in seen:
+            seen.add(target_umo)
+            targets.append(target_umo)
+
+    def _rebuild_notification_windows_index(self):
+        """Rebuild in-memory fallback notification windows from user states."""
+        primary_targets: list[str] = []
+        primary_seen: set[str] = set()
+        flavor_targets: dict[str, list[str]] = {}
+        flavor_seen: dict[str, set[str]] = {}
+
+        for state in self._user_states_cache.values():
+            self._append_unique(primary_targets, primary_seen, state.get("primary_umo"))
+            for flavor, umo in self.normalized_flavor_primary_umos(state).items():
+                flavor_targets.setdefault(flavor, [])
+                flavor_seen.setdefault(flavor, set())
+                self._append_unique(flavor_targets[flavor], flavor_seen[flavor], umo)
+
+        if primary_targets:
+            self._primary_windows_cache = primary_targets
+        if flavor_targets:
+            self._flavor_primary_windows_cache = flavor_targets
+
+    async def persist_notification_windows_index(self):
+        """Persist user-independent notification fallback windows.
+
+        The per-user state remains the source of truth, but this compact index is
+        intentionally redundant: external HAPI-created sessions have no owner, so
+        SSE notifications must still have a stable fallback after reloads or if an
+        old install has incomplete dhapi_known_users data.
+        """
+        self._rebuild_notification_windows_index()
+        await self.kv.put_kv_data("dhapi_primary_windows", self._primary_windows_cache)
+        await self.kv.put_kv_data(
+            "dhapi_flavor_primary_windows", self._flavor_primary_windows_cache
+        )
+
     def get_flavor_primary_windows(self, flavor: str | None) -> list[str]:
         """Return all configured default windows for the given flavor across users."""
         if not flavor:
@@ -218,23 +274,33 @@ class StateManager:
         targets: list[str] = []
         seen: set[str] = set()
         for state in self._user_states_cache.values():
-            target_umo = self.normalized_flavor_primary_umos(state).get(flavor_key)
-            if not target_umo or target_umo in seen:
-                continue
-            seen.add(target_umo)
-            targets.append(target_umo)
+            self._append_unique(
+                targets, seen, self.normalized_flavor_primary_umos(state).get(flavor_key)
+            )
+        for umo in self._flavor_primary_windows_cache.get(flavor_key, []):
+            self._append_unique(targets, seen, umo)
         return targets
 
     def get_primary_windows(self) -> list[str]:
-        """返回所有用户当前生效的默认通知窗口（去重后）"""
+        """返回所有用户当前生效的默认通知窗口（去重后）。
+
+        Includes a persisted global index and known window states as fallback so
+        REST-spawned sessions without owners still route to a stable Discord
+        notification window.
+        """
         targets: list[str] = []
         seen: set[str] = set()
         for state in self._user_states_cache.values():
-            primary_umo = state.get("primary_umo")
-            if not primary_umo or primary_umo in seen:
-                continue
-            seen.add(primary_umo)
-            targets.append(primary_umo)
+            self._append_unique(targets, seen, state.get("primary_umo"))
+        for umo in self._primary_windows_cache:
+            self._append_unique(targets, seen, umo)
+
+        # Last-resort stable fallback for upgraded installs where user state was
+        # not indexed yet: any window that has a persisted/loaded state or owner.
+        for umo in self.binding_mgr._window_states.keys():
+            self._append_unique(targets, seen, umo)
+        for umo in self.binding_mgr._window_sessions.keys():
+            self._append_unique(targets, seen, umo)
         return targets
 
     def select_notification_targets(
@@ -330,6 +396,30 @@ class StateManager:
 
     async def load_all(self):
         """从 KV 加载所有状态"""
+        # 加载独立的默认通知窗口索引，保证外部 REST 创建的 session 有稳定 fallback。
+        primary_windows = await self.kv.get_kv_data("dhapi_primary_windows", [])
+        if isinstance(primary_windows, list):
+            seen: set[str] = set()
+            self._primary_windows_cache = []
+            for umo in primary_windows:
+                self._append_unique(self._primary_windows_cache, seen, umo)
+
+        flavor_windows = await self.kv.get_kv_data("dhapi_flavor_primary_windows", {})
+        if isinstance(flavor_windows, dict):
+            self._flavor_primary_windows_cache = {}
+            for flavor, umos in flavor_windows.items():
+                flavor_key = str(flavor).strip().lower()
+                if flavor_key not in NOTIFICATION_ROUTE_FLAVORS or not isinstance(
+                    umos, list
+                ):
+                    continue
+                targets: list[str] = []
+                seen: set[str] = set()
+                for umo in umos:
+                    self._append_unique(targets, seen, umo)
+                if targets:
+                    self._flavor_primary_windows_cache[flavor_key] = targets
+
         # 加载用户状态
         known_users = await self.kv.get_kv_data("dhapi_known_users", [])
         for uid in known_users:
@@ -360,8 +450,19 @@ class StateManager:
                     if sid not in self.binding_mgr._window_sessions[umos]:
                         self.binding_mgr._window_sessions[umos].append(sid)
 
-        # 加载窗口状态
-        for sid, umo in self._session_owners.items():
+        # 加载窗口状态。除了 session owner，也加载默认通知窗口，避免重载后
+        # primary_windows 有值但 window_state 缺失导致 fallback 不稳定。
+        state_umos: list[str] = []
+        seen_umos: set[str] = set()
+        for umo in self._session_owners.values():
+            self._append_unique(state_umos, seen_umos, umo)
+        for umo in self.get_primary_windows():
+            self._append_unique(state_umos, seen_umos, umo)
+        for umos in self._flavor_primary_windows_cache.values():
+            for umo in umos:
+                self._append_unique(state_umos, seen_umos, umo)
+
+        for umo in state_umos:
             window_state = await self.kv.get_kv_data(f"dhapi_window_state_{umo}", None)
             if window_state:
                 self.binding_mgr.set_window_state(
@@ -369,6 +470,9 @@ class StateManager:
                     window_state.get("current_session", ""),
                     window_state.get("current_flavor", ""),
                 )
+
+        # User states are canonical; refresh and persist the compact index for future reloads.
+        await self.persist_notification_windows_index()
 
     async def migrate_to_capture_model(self):
         """数据迁移：绑定模式 → 捕获+默认窗口模式"""

@@ -3,6 +3,10 @@
 所有指令仅管理员可用
 """
 
+import asyncio
+import builtins
+import os
+
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
@@ -16,11 +20,71 @@ from .pending_manager import PendingManager
 from .sse_listener import SSEListener
 from .state_manager import StateManager
 
+_REGISTRY_KEY = "_astrbot_hapi_discord_connector_registry"
+
+
+def _process_registry() -> dict:
+    """Process-global registry that survives module reloads."""
+    registry = getattr(builtins, _REGISTRY_KEY, None)
+    if not isinstance(registry, dict):
+        registry = {"generation": 0, "plugin": None, "sse_listener": None}
+        setattr(builtins, _REGISTRY_KEY, registry)
+    return registry
+
+
+def _is_current_generation(generation_id: int) -> bool:
+    return int(_process_registry().get("generation") or 0) == int(generation_id)
+
+
+async def _cancel_stale_sse_tasks():
+    """Best-effort cleanup for listener tasks from older hot-reloaded code.
+
+    Older plugin builds did not register their SSE listener globally.  During
+    hot reload they can keep running with old notification_manager code.  Cancel
+    any still-live task whose coroutine stack comes from this plugin's
+    sse_listener.py before starting the new singleton listener.
+    """
+    current = asyncio.current_task()
+    sse_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "sse_listener.py"))
+    stale_tasks = []
+    for task in asyncio.all_tasks():
+        if task is current or task.done():
+            continue
+        stack = task.get_stack(limit=8)
+        coro = task.get_coro()
+        code = getattr(coro, "cr_code", None) or getattr(coro, "gi_code", None)
+        filenames = {
+            os.path.abspath(frame.f_code.co_filename)
+            for frame in stack
+            if getattr(frame, "f_code", None)
+        }
+        if code is not None:
+            filenames.add(os.path.abspath(code.co_filename))
+        if sse_path in filenames:
+            stale_tasks.append(task)
+
+    if not stale_tasks:
+        return
+
+    logger.warning(
+        "[dhapi] cancelling %d stale SSE task(s) from previous plugin instance",
+        len(stale_tasks),
+    )
+    for task in stale_tasks:
+        task.cancel()
+    for task in stale_tasks:
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning("[dhapi] stale SSE task ended with error: %s", exc)
+
 
 @register(
     "astrbot_plugin_hapi_discord_connector",
-    "Xia",
-    "HAPI 远程 vibe coding 的 Discord 专用版",
+    "SGSxingchen",
+    "HAPI 远程 coding 的 Discord 专用版：/dhapi 原生交互与 session 管理",
     "1.0.0",
 )
 class HapiDiscordConnectorPlugin(Star):
@@ -65,16 +129,15 @@ class HapiDiscordConnectorPlugin(Star):
         self.state_mgr = StateManager(self, self.binding_mgr)
 
         # 通知管理器
-        self.notification_mgr = NotificationManager(self.context, self.state_mgr)
+        self.notification_mgr = NotificationManager(self.context, self.state_mgr, self)
 
         # SSE 监听器
         self.sse_listener = SSEListener(
             self.client,
             self.sessions_cache,
-            lambda text, sid: self.notification_mgr.push_notification(
-                text, sid, self.sessions_cache
-            ),
+            self._notify_from_sse,
         )
+        self.sse_listener.set_kv(self)
 
         # 待审批管理器
         self.pending_mgr = PendingManager(self.sse_listener)
@@ -100,6 +163,18 @@ class HapiDiscordConnectorPlugin(Star):
             return event.get_platform_name() == "discord"
         except Exception:
             return False
+
+    async def _notify_from_sse(self, text: str, sid: str):
+        """Generation-guarded SSE notification callback."""
+        generation_id = int(getattr(self, "_generation_id", 0) or 0)
+        if generation_id and not _is_current_generation(generation_id):
+            logger.info(
+                "[dhapi] skip stale plugin notification generation=%s sid=%s",
+                generation_id,
+                sid[:8] if sid else "global",
+            )
+            return
+        await self.notification_mgr.push_notification(text, sid, self.sessions_cache)
 
     @filter.on_llm_request()
     async def on_llm_request_hook(self, event: AstrMessageEvent, request):
@@ -290,6 +365,33 @@ class HapiDiscordConnectorPlugin(Star):
 
     async def initialize(self):
         """插件初始化：打开 client、加载用户状态、启动 SSE"""
+        registry = _process_registry()
+        old_listener = registry.get("sse_listener")
+        old_plugin = registry.get("plugin")
+        if old_listener is not None and old_listener is not self.sse_listener:
+            logger.warning("[dhapi] 检测到旧 HAPI Discord Connector SSE，正在停止")
+            try:
+                setattr(old_listener, "_stopped", True)
+                await old_listener.stop()
+            except Exception as exc:
+                logger.warning("[dhapi] 停止旧 SSE listener 失败: %s", exc)
+        if old_plugin is not None and old_plugin is not self:
+            old_client = getattr(old_plugin, "client", None)
+            if old_client is not None and old_client is not self.client:
+                try:
+                    await old_client.close()
+                except Exception as exc:
+                    logger.warning("[dhapi] 关闭旧 HAPI client 失败: %s", exc)
+
+        await _cancel_stale_sse_tasks()
+
+        generation_id = int(registry.get("generation") or 0) + 1
+        registry["generation"] = generation_id
+        registry["plugin"] = self
+        registry["sse_listener"] = self.sse_listener
+        self._generation_id = generation_id
+        logger.info("[dhapi] activate singleton generation=%s", generation_id)
+
         await self.client.init()
 
         # 从 KV 加载状态
@@ -305,6 +407,7 @@ class HapiDiscordConnectorPlugin(Star):
             logger.warning("初始化加载 session 列表失败: %s", e)
 
         # 加载已有的待审批请求（重启/断联后恢复）
+        await self.sse_listener.load_compact_state()
         await self.sse_listener.load_existing_pending()
 
         # 启动 SSE
@@ -320,11 +423,22 @@ class HapiDiscordConnectorPlugin(Star):
             auto_approve_enabled=auto_approve,
             summary_msg_count=self._summary_msg_count,
             max_reconnect_attempts=max_reconnect,
+            generation_id=generation_id,
+            is_current_generation=_is_current_generation,
         )
         logger.info("HAPI Discord Connector 已初始化，SSE 输出级别: %s", output_level)
 
     async def terminate(self):
         """插件销毁：停止 SSE、关闭 client"""
+        registry = _process_registry()
+        if registry.get("sse_listener") is self.sse_listener:
+            registry["sse_listener"] = None
+        if registry.get("plugin") is self:
+            registry["plugin"] = None
+        if int(registry.get("generation") or 0) == int(
+            getattr(self, "_generation_id", 0)
+        ):
+            registry["generation"] = int(registry.get("generation") or 0) + 1
         await self.sse_listener.stop()
         await self.client.close()
         logger.info("HAPI Discord Connector 已销毁")

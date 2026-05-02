@@ -1298,6 +1298,8 @@ class ApprovalView(DhapiBaseView):
     async def _deny_item(self, sid: str, rid: str, req: dict) -> tuple[bool, str]:
         if is_compact_request(req):
             self.plugin.pending_mgr.remove_entry(sid, rid)
+            if hasattr(self.plugin.sse_listener, "mark_compact_denied"):
+                self.plugin.sse_listener.mark_compact_denied(sid, 60)
             return True, "/compact 已取消"
         if self.plugin.pending_mgr.is_llm_tool_request(req):
             original_req = self.plugin.sse_listener.pending.get(sid, {}).get(rid, {})
@@ -1417,6 +1419,77 @@ class ApprovalView(DhapiBaseView):
         await self.edit(
             interaction, DhapiMainView.panel_embed(self.plugin, self.event), view
         )
+
+
+class ApprovalNoticeView(DhapiBaseView):
+    """Lightweight approval buttons attached to a single approval notification."""
+
+    def __init__(self, plugin, event, sid: str, rid: str):
+        super().__init__(plugin, event)
+        self.sid = sid
+        self.rid = rid
+
+    def _current_item(self) -> tuple[str, str, dict] | None:
+        req = self.plugin.sse_listener.pending.get(self.sid, {}).get(self.rid)
+        if not req:
+            return None
+        return self.sid, self.rid, req
+
+    async def _edit_panel(self, interaction: discord.Interaction, note: str = ""):
+        await self.refresh_sessions()
+        view = ApprovalView(self.plugin, self.event)
+        await self.edit(interaction, view.build_embed(note), view)
+
+    async def _approve_current(self) -> tuple[bool, str]:
+        item = self._current_item()
+        if not item:
+            return False, "请求已处理或不存在。"
+        return await ApprovalView._approve_item(self, *item)
+
+    async def _deny_current(self) -> tuple[bool, str]:
+        item = self._current_item()
+        if not item:
+            return False, "请求已处理或不存在。"
+        return await ApprovalView._deny_item(self, *item)
+
+    @discord.ui.button(
+        label="批准",
+        style=discord.ButtonStyle.success,
+        emoji="✅",
+        custom_id="dhapi:notice:approve",
+    )
+    async def approve_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        ok, msg = await self._approve_current()
+        await self._edit_panel(
+            interaction, ("✅ 已批准：" if ok else "❌ 批准失败：") + msg
+        )
+
+    @discord.ui.button(
+        label="拒绝",
+        style=discord.ButtonStyle.danger,
+        emoji="🚫",
+        custom_id="dhapi:notice:deny",
+    )
+    async def deny_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        ok, msg = await self._deny_current()
+        await self._edit_panel(
+            interaction, ("✅ 已拒绝：" if ok else "❌ 拒绝失败：") + msg
+        )
+
+    @discord.ui.button(
+        label="打开/刷新审批面板",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔄",
+        custom_id="dhapi:notice:panel",
+    )
+    async def panel_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        await self._edit_panel(interaction)
 
 
 class ConfigView(DhapiBaseView):

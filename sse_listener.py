@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import json
+import time
 from collections.abc import Awaitable, Callable
 
 from astrbot.api import logger
@@ -32,6 +33,7 @@ class SSEListener:
         self.client = client
         self.sessions_cache = sessions_cache
         self.notify_callback = notify_callback
+        self.kv = None
         self.output_level: str = "detail"
         # {session_id: {request_id: {tool, arguments, ...}}}
         self.pending: dict[str, dict] = {}
@@ -61,12 +63,76 @@ class SSEListener:
         self._message_notified_seqs: dict[str, int] = {}
         # {session_id: seq}，记录已处理的压缩完成消息序号，防止重复发「继续」
         self._compaction_completed_seqs: dict[str, int] = {}
+        # {session_id: monotonic time}，用户拒绝 compact 后短期不再弹同一审批。
+        self._compact_denied_until: dict[str, float] = {}
+        # {session_id: monotonic time}，compact reminder 节流。
+        self._compact_remind_last: dict[str, float] = {}
         # {session_id: seq}，记录已发送“任务完成”通知时的 lastSeq，防止状态抖动重复提醒
         self._completion_notified_seqs: dict[str, int] = {}
         # {session_id: [text, ...]}，短暂排队权限类通知，先补普通消息再发送
         self._queued_request_notifications: dict[str, list[str]] = {}
         self._request_notify_sids: set[str] = set()
         self._request_notify_task: asyncio.Task | None = None
+        self._debounce_sids: set[str] = set()
+        self._debounce_task: asyncio.Task | None = None
+        self._completion_sids: set[str] = set()
+        self._completion_task: asyncio.Task | None = None
+        self._compact_check_sids: set[str] = set()
+        self._compact_check_task: asyncio.Task | None = None
+        self._stopped: bool = True
+        self._generation_id: int = 0
+        self._is_current_generation: Callable[[int], bool] | None = None
+
+    def set_kv(self, kv):
+        self.kv = kv
+
+    async def load_compact_state(self):
+        """Load compact dedupe seqs persisted across plugin reloads."""
+        if self.kv is None:
+            return
+        notified = await self.kv.get_kv_data("dhapi_compact_notified_seqs", {})
+        completed = await self.kv.get_kv_data("dhapi_compaction_completed_seqs", {})
+        self._compact_notified_seqs = self._normalize_seq_map(notified)
+        self._compaction_completed_seqs = self._normalize_seq_map(completed)
+
+    @staticmethod
+    def _normalize_seq_map(raw) -> dict[str, int]:
+        result: dict[str, int] = {}
+        if not isinstance(raw, dict):
+            return result
+        for sid, seq in raw.items():
+            try:
+                result[str(sid)] = int(seq)
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    async def _persist_compact_notified(self):
+        if self.kv is not None and self._active():
+            await self.kv.put_kv_data(
+                "dhapi_compact_notified_seqs", self._compact_notified_seqs
+            )
+
+    async def _persist_compaction_completed(self):
+        if self.kv is not None and self._active():
+            await self.kv.put_kv_data(
+                "dhapi_compaction_completed_seqs",
+                self._compaction_completed_seqs,
+            )
+
+    def mark_compact_denied(self, sid: str, cooldown_seconds: int = 60):
+        """Suppress repeated compact prompts after the user explicitly denies."""
+        self._compact_denied_until[sid] = time.monotonic() + max(1, cooldown_seconds)
+
+    def _active(self) -> bool:
+        if self._stopped:
+            return False
+        if self._is_current_generation is None:
+            return True
+        try:
+            return bool(self._is_current_generation(self._generation_id))
+        except Exception:
+            return False
 
     def start(
         self,
@@ -76,8 +142,13 @@ class SSEListener:
         auto_approve_enabled: bool = False,
         summary_msg_count: int = 5,
         max_reconnect_attempts: int = 0,
+        generation_id: int = 0,
+        is_current_generation: Callable[[int], bool] | None = None,
     ):
         """启动 SSE 监听任务"""
+        self._stopped = False
+        self._generation_id = generation_id
+        self._is_current_generation = is_current_generation
         self.output_level = output_level
         self._summary_msg_count = summary_msg_count
         self._remind_enabled = remind_pending
@@ -100,6 +171,7 @@ class SSEListener:
 
     async def stop(self):
         """停止 SSE 监听"""
+        self._stopped = True
         for task in (
             self._task,
             self._remind_task,
@@ -116,12 +188,20 @@ class SSEListener:
                     pass
         self._task = None
         self._remind_task = None
+        self._debounce_task = None
+        self._completion_task = None
+        self._compact_check_task = None
         self._request_notify_task = None
+        self._debounce_sids.clear()
+        self._completion_sids.clear()
+        self._compact_check_sids.clear()
         self._queued_request_notifications = {}
         self._request_notify_sids.clear()
 
     def wake_up(self):
         """唤醒休眠的监听器（重置失败计数并重启任务）"""
+        if self._stopped or not self._active():
+            return
         if self._hibernated:
             self._hibernated = False
             self.conn_fail_count = 0
@@ -148,6 +228,12 @@ class SSEListener:
         max_backoff = 60
 
         while True:
+            if not self._active():
+                logger.info(
+                    "SSE 监听器 generation=%s 已失效，退出 listen_loop",
+                    self._generation_id,
+                )
+                return
             resp = None
             try:
                 resp = await self.client.subscribe_events_raw(all_events=True)
@@ -155,6 +241,8 @@ class SSEListener:
                 buf = b""
                 got_data = False
                 while True:
+                    if not self._active():
+                        return
                     chunk = await resp.content.read(1024 * 1024)
                     if not chunk:
                         break
@@ -184,6 +272,8 @@ class SSEListener:
                             evt = json.loads(line[6:])
                         except json.JSONDecodeError:
                             continue
+                        if not self._active():
+                            return
                         await self._handle(evt)
 
             except asyncio.CancelledError:
@@ -210,6 +300,8 @@ class SSEListener:
 
             # 检查是否达到重连上限
             if self._max_reconnect > 0 and self.conn_fail_count >= self._max_reconnect:
+                if not self._active():
+                    return
                 self._hibernated = True
                 logger.warning(
                     "SSE 已连续失败 %d 次，达到重连上限，进入休眠。打开 /dhapi 面板可重新唤醒",
@@ -226,10 +318,14 @@ class SSEListener:
                 logger.warning("SSE 已连续失败 20 次，请检查 HAPI 服务或网络")
 
             await asyncio.sleep(backoff)
+            if not self._active():
+                return
             backoff = min(backoff * 2, max_backoff)
 
     async def _handle(self, evt: dict):
         """处理单个 SSE 事件"""
+        if not self._active():
+            return
         etype = evt.get("type")
         if etype != "session-updated":
             return
@@ -424,7 +520,17 @@ class SSEListener:
     def _mark_messages_notified(self, sid: str, latest_visible_seq: int):
         self._message_notified_seqs[sid] = latest_visible_seq
 
+    @staticmethod
+    def _suppress_channel_message(text: str | None) -> bool:
+        """Suppress upstream bookkeeping summaries from Discord channel pushes."""
+        if not text:
+            return True
+        stripped = text.strip()
+        return stripped.startswith("[Summary]:") or stripped.startswith("[System]:")
+
     def _queue_request_notifications(self, sid: str, texts: list[str]):
+        if not self._active():
+            return
         if not texts:
             return
         self._queued_request_notifications.setdefault(sid, []).extend(texts)
@@ -435,18 +541,16 @@ class SSEListener:
             )
 
     async def _flush_request_notifications(self, sid: str):
+        if not self._active():
+            return
         queued = self._queued_request_notifications.pop(sid, [])
         if not queued:
             return
 
-        if self.output_level in ("detail", "simple"):
-            async with self._lock:
-                old_seq = self.session_states.get(sid, {}).get("lastSeq", -1)
-            if old_seq >= 0:
-                if self.output_level == "detail":
-                    await self._show_detail(sid, old_seq)
-                else:
-                    await self._show_simple(sid, old_seq)
+        # Do not flush ordinary message summaries immediately before approval
+        # cards.  That path produced a confusing "HAPI 消息 - ..." card followed
+        # by the real approval card for the same user action.  The normal
+        # debounce/completion paths still handle non-approval agent messages.
 
         for text in queued:
             await self._push_notification(text, sid)
@@ -454,6 +558,8 @@ class SSEListener:
     async def _debounced_request_notifications(self):
         while True:
             await asyncio.sleep(0.5)
+            if not self._active():
+                return
             sids = list(self._request_notify_sids)
             self._request_notify_sids.clear()
             for sid in sids:
@@ -465,6 +571,8 @@ class SSEListener:
         """防抖：等待状态稳定后再推送任务完成通知（避免 Codex 频繁切换 thinking 导致重复推送）"""
         while True:
             await asyncio.sleep(1.5)
+            if not self._active():
+                return
             sids = list(self._completion_sids)
             self._completion_sids.clear()
             for sid in sids:
@@ -498,11 +606,15 @@ class SSEListener:
         self, sid: str, messages: list[dict], old_seq: int
     ):
         """检测新消息中是否含 Prompt is too long 或 Compaction completed，触发对应流程"""
+        if not self._active():
+            return
         last_notified = self._compact_notified_seqs.get(sid, -1)
         last_completed = self._compaction_completed_seqs.get(sid, -1)
         triggered_compact = False
 
         for msg in messages:
+            if not self._active():
+                return
             seq = msg.get("seq", 0)
             if seq <= old_seq:
                 continue
@@ -519,10 +631,31 @@ class SSEListener:
                 and "prompt is too long" in text_lower
             ):
                 triggered_compact = True
+                now = time.monotonic()
+                if now < self._compact_denied_until.get(sid, 0):
+                    logger.info(
+                        "跳过 compact 审批：sid=%s seq=%s 仍在拒绝冷却期",
+                        sid[:8],
+                        seq,
+                    )
+                    continue
+                async with self._lock:
+                    if "__compact__" in self.pending.get(sid, {}):
+                        logger.info(
+                            "跳过重复 compact 审批：sid=%s 已有未处理 __compact__",
+                            sid[:8],
+                        )
+                        continue
+
                 self._compact_notified_seqs[sid] = seq
+                await self._persist_compact_notified()
+                if not self._active():
+                    return
                 label = session_label_short(sid, self.sessions_cache)
                 if self._auto_approve_enabled:
                     ok, _ = await session_ops.send_message(self.client, sid, "/compact")
+                    if not self._active():
+                        return
                     mark = "✓" if ok else "✗"
                     await self._push_notification(
                         f"[自动审批] 已自动压缩上下文\n{label}\n  {mark} /compact",
@@ -530,6 +663,14 @@ class SSEListener:
                     )
                 else:
                     async with self._lock:
+                        if not self._active():
+                            return
+                        if "__compact__" in self.pending.get(sid, {}):
+                            logger.info(
+                                "跳过重复 compact 审批：sid=%s 已有未处理 __compact__",
+                                sid[:8],
+                            )
+                            continue
                         # 为压缩请求分配序号
                         compact_req = {
                             "tool": "__compact__",
@@ -540,6 +681,8 @@ class SSEListener:
                         total = sum(len(r) for r in self.pending.values())
                         session_total = len(self.pending.get(sid, {}))
 
+                    if not self._active():
+                        return
                     index = compact_req["index"]
                     lines = [
                         f"⚠ 上下文过长\n{label}",
@@ -555,8 +698,13 @@ class SSEListener:
             # 检测 Compaction completed → 自动发送「继续」恢复会话
             if seq > last_completed and "compaction completed" in text_lower:
                 self._compaction_completed_seqs[sid] = seq
+                await self._persist_compaction_completed()
+                if not self._active():
+                    return
                 label = session_label_short(sid, self.sessions_cache)
                 ok, _ = await session_ops.send_message(self.client, sid, "继续")
+                if not self._active():
+                    return
                 mark = "✓" if ok else "✗"
                 await self._push_notification(
                     f"[上下文压缩完成] 已自动发送「继续」\n{label}\n  {mark}", sid
@@ -565,6 +713,8 @@ class SSEListener:
     async def _debounced_compact_check(self):
         """silence 模式下防抖检测 Prompt is too long"""
         await asyncio.sleep(0.5)
+        if not self._active():
+            return
         sids = list(self._compact_check_sids)
         self._compact_check_sids.clear()
         for sid in sids:
@@ -588,6 +738,8 @@ class SSEListener:
         """等一小段时间再拉取，合并密集的 SSE 事件"""
         while True:
             await asyncio.sleep(0.5)
+            if not self._active():
+                return
             sids = list(self._debounce_sids)
             self._debounce_sids.clear()
             for sid in sids:
@@ -603,6 +755,8 @@ class SSEListener:
 
     async def _show_detail(self, sid: str, old_seq: int) -> bool:
         """detail 模式：获取并显示所有新消息（使用统一格式）"""
+        if not self._active():
+            return False
         try:
             messages = await session_ops.fetch_messages(self.client, sid, limit=20)
             if not messages:
@@ -620,7 +774,7 @@ class SSEListener:
             for msg in new_msgs:
                 content = msg.get("content", {})
                 text = extract_text_preview(content, max_len=0)
-                if text is not None:
+                if not self._suppress_channel_message(text):
                     visible_msgs.append((msg, text))
 
             # 更新 lastSeq
@@ -661,6 +815,8 @@ class SSEListener:
 
     async def _show_simple(self, sid: str, old_seq: int) -> bool:
         """simple 模式：获取并显示新的 agent 纯文本消息"""
+        if not self._active():
+            return False
         try:
             messages = await session_ops.fetch_messages(self.client, sid, limit=50)
             if not messages:
@@ -675,7 +831,7 @@ class SSEListener:
                 if content.get("role") not in ("agent", "assistant"):
                     continue
                 text = extract_text_preview(content, max_len=0)
-                if text is None or text.startswith("🛠️"):
+                if self._suppress_channel_message(text) or text.startswith("🛠️"):
                     continue
                 agent_texts.append((msg, text))
 
@@ -717,6 +873,8 @@ class SSEListener:
 
     async def _show_summary(self, sid: str, old_seq: int) -> bool:
         """summary 模式：获取并显示最近 N 条新 agent 消息（过滤工具调用）"""
+        if not self._active():
+            return False
         try:
             messages = await session_ops.fetch_messages(self.client, sid, limit=50)
             if not messages:
@@ -730,7 +888,7 @@ class SSEListener:
                 if content.get("role") not in ("agent", "assistant"):
                     continue
                 text = extract_text_preview(content, max_len=0)
-                if text is None or text.startswith("🛠️"):
+                if self._suppress_channel_message(text) or text.startswith("🛠️"):
                     continue
                 agent_texts.append((msg, text))
 
@@ -775,14 +933,30 @@ class SSEListener:
             await asyncio.sleep(self._remind_interval)
         except asyncio.CancelledError:
             return
+        if not self._active():
+            return
         async with self._lock:
             if not self.pending:
                 return
             pending_snapshot = self.get_all_pending()
 
         total = sum(len(r) for r in pending_snapshot.values())
+        now = time.monotonic()
         for sid, reqs in pending_snapshot.items():
-            count = len(reqs)
+            non_compact_reqs = {
+                rid: req for rid, req in reqs.items() if rid != "__compact__"
+            }
+            compact_only = "__compact__" in reqs and not non_compact_reqs
+            if compact_only:
+                last = self._compact_remind_last.get(sid, 0)
+                if now - last < 60:
+                    continue
+                self._compact_remind_last[sid] = now
+                display_reqs = reqs
+            else:
+                display_reqs = reqs
+
+            count = len(display_reqs)
             if count == 0:
                 continue
             label = session_label_short(sid, self.sessions_cache)
@@ -811,6 +985,13 @@ class SSEListener:
 
     async def _push_notification(self, text: str, session_id: str):
         """通过回调向所有已注册的管理员推送消息"""
+        if not self._active():
+            logger.info(
+                "[dhapi] skip stale SSE notification generation=%s sid=%s",
+                self._generation_id,
+                session_id[:8] if session_id else "global",
+            )
+            return
         logger.info(
             "[dhapi] SSE push_notification sid=%s text_len=%s",
             session_id[:8] if session_id else "global",
