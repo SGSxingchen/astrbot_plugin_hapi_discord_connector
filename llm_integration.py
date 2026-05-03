@@ -53,7 +53,7 @@ class LLMIntegration:
         """移除所有 dhapi_coding 工具
 
         Args:
-            keep_basic: 是否保留基础工具（list_sessions/list_commands/execute_command）
+            keep_basic: 是否保留基础工具（list_sessions/list_commands/execute_command/send_message）
         """
         if not hasattr(request, "func_tool") or not request.func_tool:
             return
@@ -63,6 +63,7 @@ class LLMIntegration:
             "dhapi_coding_list_sessions",
             "dhapi_coding_list_commands",
             "dhapi_coding_execute_command",
+            "dhapi_coding_send_message",
             "dhapi_coding_switch_session",
             "dhapi_coding_create_session",
             "dhapi_coding_get_config_status",
