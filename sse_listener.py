@@ -29,10 +29,12 @@ class SSEListener:
         client: AsyncHapiClient,
         sessions_cache: list[dict],
         notify_callback: Callable[[str, str], Awaitable[None]],
+        agent_final_callback: Callable[[dict], Awaitable[None]] | None = None,
     ):
         self.client = client
         self.sessions_cache = sessions_cache
         self.notify_callback = notify_callback
+        self.agent_final_callback = agent_final_callback
         self.kv = None
         self.output_level: str = "detail"
         # {session_id: {request_id: {tool, arguments, ...}}}
@@ -75,7 +77,7 @@ class SSEListener:
         self._request_notify_task: asyncio.Task | None = None
         self._debounce_sids: set[str] = set()
         self._debounce_task: asyncio.Task | None = None
-        self._completion_sids: set[str] = set()
+        self._completion_sids: dict[str, int] = {}
         self._completion_task: asyncio.Task | None = None
         self._compact_check_sids: set[str] = set()
         self._compact_check_task: asyncio.Task | None = None
@@ -157,7 +159,7 @@ class SSEListener:
         self._max_reconnect = max_reconnect_attempts
         self._debounce_sids: set[str] = set()
         self._debounce_task: asyncio.Task | None = None
-        self._completion_sids: set[str] = set()
+        self._completion_sids: dict[str, int] = {}
         self._completion_task: asyncio.Task | None = None
         self._compact_check_sids: set[str] = set()
         self._compact_check_task: asyncio.Task | None = None
@@ -458,7 +460,8 @@ class SSEListener:
             async with self._lock:
                 pending_count = len(self.pending.get(sid, {}))
             if pending_count == 0:
-                self._completion_sids.add(sid)
+                prev = self._completion_sids.get(sid)
+                self._completion_sids[sid] = old_seq if prev is None else min(prev, old_seq)
                 if self._completion_task is None or self._completion_task.done():
                     self._completion_task = asyncio.create_task(
                         self._debounced_completion()
@@ -573,9 +576,9 @@ class SSEListener:
             await asyncio.sleep(1.5)
             if not self._active():
                 return
-            sids = list(self._completion_sids)
+            completion_items = list(self._completion_sids.items())
             self._completion_sids.clear()
-            for sid in sids:
+            for sid, completion_old_seq in completion_items:
                 async with self._lock:
                     state = self.session_states.get(sid, {})
                     has_pending = len(self.pending.get(sid, {})) > 0
@@ -587,6 +590,7 @@ class SSEListener:
                         await self._show_detail(sid, last_seq)
                     elif self.output_level == "simple":
                         await self._show_simple(sid, last_seq)
+                    await self._trigger_agent_final_if_any(sid, completion_old_seq)
 
                     async with self._lock:
                         last_seq = self.session_states.get(sid, {}).get(
@@ -601,6 +605,56 @@ class SSEListener:
                     )
             if not self._completion_sids:
                 break
+
+    async def _trigger_agent_final_if_any(self, sid: str, old_seq: int):
+        """On a HAPI-side completion edge, forward the latest final assistant text.
+
+        This is deliberately tied to the raw SSE session-updated completion path
+        (thinking -> idle) and fetches persisted messages only after that edge.
+        It does not consume streaming deltas and does not react to Discord /
+        AstrBot bot output.
+        """
+        if not self._active() or self.agent_final_callback is None or old_seq < 0:
+            return
+        try:
+            messages = await session_ops.fetch_messages(self.client, sid, limit=50)
+        except Exception as exc:
+            logger.warning("agent final trigger 拉取消息失败 (sid=%s): %s", sid[:8], exc)
+            return
+        final_msg = None
+        final_text = None
+        for msg in sorted(messages or [], key=lambda m: m.get("seq", 0)):
+            if msg.get("seq", 0) <= old_seq:
+                continue
+            content = msg.get("content", {}) or {}
+            if content.get("role") not in ("agent", "assistant"):
+                continue
+            text = extract_text_preview(content, max_len=0)
+            if self._suppress_channel_message(text) or (text or "").startswith("🛠️"):
+                continue
+            final_msg = msg
+            final_text = text
+        if not final_msg or not final_text:
+            return
+
+        session = next((s for s in self.sessions_cache if s.get("id") == sid), None)
+        agent = ((session or {}).get("metadata") or {}).get("flavor", "")
+        seq = final_msg.get("seq", 0)
+        raw_id = (
+            final_msg.get("id")
+            or final_msg.get("messageId")
+            or final_msg.get("eventId")
+            or seq
+        )
+        event_id = f"{sid}:{raw_id}:assistant-final"
+        await self.agent_final_callback(
+            {
+                "session_id": sid,
+                "agent": str(agent or "").strip().lower(),
+                "event_id": event_id,
+                "content": final_text,
+            }
+        )
 
     async def _check_and_handle_compact(
         self, sid: str, messages: list[dict], old_seq: int

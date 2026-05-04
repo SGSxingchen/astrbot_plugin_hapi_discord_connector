@@ -1,5 +1,12 @@
 # 更新日志
 
+## v1.1.0 — DHAPI agent final 自动触发主链
+
+1. 新增 `enable_agent_final_trigger` 配置项，支持在 HAPI/Codex assistant final 回包后触发 AstrBot 主链。
+2. 新增 `trigger_agents`、`trigger_message_template`、`max_content_chars`、`dedupe_ttl_seconds` 配置项。
+3. 触发机制只监听 HAPI 原始 SSE 完成边沿，不修改 Discord adapter，也不关闭 bot-message 过滤。
+4. synthetic event 带有 `source=dhapi_agent`、`synthetic=true`、`session_id`、`agent`、`event_id` 标记，并带去重和截断保护。
+
 ## v2.0.6 - 新增 `/hapi resume` 指令，用于恢复已经存档的session
 
 ## v2.0.5 — Codex 思考深度支持

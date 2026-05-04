@@ -89,5 +89,37 @@
     "type": "int",
     "default": 5793266,
     "hint": "默认 0x5865F2（Discord 紫蓝）"
+  },
+  "enable_agent_final_trigger": {
+    "description": "DHAPI agent final 回包后触发 AstrBot 主链（默认关闭）",
+    "type": "bool",
+    "default": false,
+    "hint": "仅响应 HAPI 原始 SSE 完成事件中的 assistant final 消息；不会响应 Discord/AstrBot 自己输出"
+  },
+  "trigger_agents": {
+    "description": "允许触发主链的 agent 列表",
+    "type": "list",
+    "default": [
+      "codex"
+    ],
+    "hint": "第一版默认仅 codex，可添加 claude/gemini/opencode 等 flavor"
+  },
+  "trigger_message_template": {
+    "description": "触发 AstrBot 主链时构造的 synthetic user 消息模板",
+    "type": "string",
+    "default": "【DHAPI_AGENT_FINAL】Codex 会话已完成。这是来自 HAPI/Codex 的 assistant final 回包，不是用户新任务，请不要把它再次发送给 Codex。\n完成信息：\n{content}",
+    "hint": "可使用 {content} 占位 agent final 内容"
+  },
+  "max_content_chars": {
+    "description": "agent final 内容最大注入字符数",
+    "type": "int",
+    "default": 12000,
+    "hint": "超过会截断，避免超长 final 塞爆上下文"
+  },
+  "dedupe_ttl_seconds": {
+    "description": "agent final event_id 去重 TTL（秒）",
+    "type": "int",
+    "default": 3600,
+    "hint": "避免 SSE 重连或重复 poll 导致重复触发"
   }
 }

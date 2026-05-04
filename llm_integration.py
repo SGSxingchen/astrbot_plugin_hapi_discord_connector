@@ -365,6 +365,11 @@ class LLMIntegration:
         auto_approve = self.plugin.sse_listener._auto_approve_enabled
         remind = self.plugin.sse_listener._remind_enabled
         remind_interval = self.plugin.sse_listener._remind_interval
+        agent_final_trigger = self.plugin.config.get(
+            "enable_agent_final_trigger", False
+        )
+        trigger_agents = self.plugin.config.get("trigger_agents", ["codex"])
+        max_content_chars = self.plugin.config.get("max_content_chars", 12000)
         info = f"""当前配置状态:
 
 output_level (SSE推送级别): {output_level}
@@ -379,6 +384,12 @@ auto_approve_enabled (24小时自动审批): {"开启" if auto_approve else "关
 
 remind_pending (定时提醒待审批): {"开启" if remind else "关闭"}
   间隔: {remind_interval} 秒
+  值: true/false
+
+enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if agent_final_trigger else "关闭"}
+  仅响应 HAPI 原始 SSE 完成事件中的 assistant final；默认只支持 codex
+  trigger_agents: {trigger_agents}
+  max_content_chars: {max_content_chars}
   值: true/false"""
         return info
 
@@ -626,6 +637,11 @@ remind_pending (定时提醒待审批): {"开启" if remind else "关闭"}
             bool_val = value.lower() in ["true", "1", "yes", "on", "开启"]
             self.plugin.sse_listener._remind_enabled = bool_val
             self.plugin.config["remind_pending"] = bool_val
+            self.plugin.config.save_config()
+            return f"✅ 已设置 {config_name} = {bool_val}"
+        elif config_name == "enable_agent_final_trigger":
+            bool_val = value.lower() in ["true", "1", "yes", "on", "开启"]
+            self.plugin.config["enable_agent_final_trigger"] = bool_val
             self.plugin.config.save_config()
             return f"✅ 已设置 {config_name} = {bool_val}"
         else:

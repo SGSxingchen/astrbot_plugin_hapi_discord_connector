@@ -14,6 +14,7 @@ from astrbot.api.star import Context, Star, register
 from . import session_ops
 from .binding_manager import BindingManager
 from .cf_access import CfAccessManager
+from .agent_final_trigger import AgentFinalPayload, AgentFinalTrigger
 from .hapi_client import AsyncHapiClient
 from .notification_manager import NotificationManager
 from .pending_manager import PendingManager
@@ -132,10 +133,12 @@ class HapiDiscordConnectorPlugin(Star):
         self.notification_mgr = NotificationManager(self.context, self.state_mgr, self)
 
         # SSE 监听器
+        self.agent_final_trigger = AgentFinalTrigger(self)
         self.sse_listener = SSEListener(
             self.client,
             self.sessions_cache,
             self._notify_from_sse,
+            self._trigger_agent_final_from_sse,
         )
         self.sse_listener.set_kv(self)
 
@@ -176,12 +179,27 @@ class HapiDiscordConnectorPlugin(Star):
             return
         await self.notification_mgr.push_notification(text, sid, self.sessions_cache)
 
+    async def _trigger_agent_final_from_sse(self, payload: dict):
+        """SSE-only hook: enqueue a synthetic AstrBot user event for final text."""
+        generation_id = int(getattr(self, "_generation_id", 0) or 0)
+        if generation_id and not _is_current_generation(generation_id):
+            return
+        await self.agent_final_trigger.trigger(
+            AgentFinalPayload(
+                session_id=str(payload.get("session_id") or ""),
+                agent=str(payload.get("agent") or ""),
+                event_id=str(payload.get("event_id") or ""),
+                content=str(payload.get("content") or ""),
+            )
+        )
+
     @filter.on_llm_request()
     async def on_llm_request_hook(self, event: AstrMessageEvent, request):
         """LLM 工具可见性控制钩子；非 Discord 平台移除 dhapi 工具。"""
         if not self._is_discord_event(event):
             self.llm_integration._remove_hapi_tools(request, keep_basic=False)
             return
+        self.agent_final_trigger.remember_event(event)
         await self.llm_integration.on_llm_request_hook(event, request)
 
     # ──── LLM 工具代理方法 ────
@@ -450,6 +468,7 @@ class HapiDiscordConnectorPlugin(Star):
         """打开 HAPI Discord 原生交互面板。"""
         if not self._is_discord_event(event):
             return
+        self.agent_final_trigger.remember_event(event)
 
         event.call_llm = True
         webhook = getattr(event, "interaction_followup_webhook", None)
