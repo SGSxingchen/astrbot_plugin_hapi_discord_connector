@@ -253,6 +253,15 @@ class LLMIntegration:
             )
         return None, self._missing_session_text()
 
+    def validate_sid(self, sid: str) -> bool:
+        """检查 sid 是否存在于当前 sessions_cache。"""
+        target = str(sid or "").strip()
+        return bool(target) and any(s.get("id") == target for s in self.sessions_cache)
+
+    @staticmethod
+    def _missing_sid_text(sid: str) -> str:
+        return f"session_id `{str(sid or '')[:8]}` 不存在，请用 dhapi_coding_list_sessions 确认。"
+
     @staticmethod
     def _missing_session_text() -> str:
         return (
@@ -279,6 +288,8 @@ class LLMIntegration:
         sid, error = self._resolve_sid_text(event, session_id)
         if error:
             return error
+        if not self.validate_sid(sid):
+            return self._missing_sid_text(sid)
 
         try:
             detail = await session_ops.fetch_session_detail(self.client, sid)
@@ -389,6 +400,8 @@ class LLMIntegration:
         sid, error = self._resolve_sid_text(event, session_id)
         if error:
             return error
+        if not self.validate_sid(sid):
+            return self._missing_sid_text(sid)
 
         try:
             # 多取消息以保证覆盖 N 轮
@@ -459,7 +472,8 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         return (
             "Discord 侧仅保留 /dhapi 一个入口，会打开按钮/下拉菜单/Modal 控制面板；"
             "不再支持 /dhapi list/sw/a/deny 等文本子命令。\n"
-            "LLM 可直接使用 dhapi_coding_list_sessions、dhapi_coding_join_session、"
+            "请在 /dhapi 面板加入/退出 session；LLM 可直接使用 "
+            "dhapi_coding_list_sessions、dhapi_coding_join_session、"
             "dhapi_coding_send_message、dhapi_coding_stop_message 等工具完成操作。"
         )
 
@@ -477,6 +491,8 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         sid, error = self._resolve_sid_text(event, session_id)
         if error:
             return error
+        if not self.validate_sid(sid):
+            return self._missing_sid_text(sid)
 
         # 请求审批
         approved, reason = await self._require_approval(
@@ -540,6 +556,8 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             return error
 
         sid = chosen["id"]
+        if not self.validate_sid(sid):
+            return self._missing_sid_text(sid)
         flavor = (chosen.get("metadata") or {}).get("flavor", "claude")
         await self.state_mgr.join_session(sid, event.unified_msg_origin, flavor)
         await self.state_mgr.set_user_state(event)
@@ -556,6 +574,8 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         sid, error = self._resolve_sid_text(event, session_id)
         if error:
             return error
+        if not self.validate_sid(sid):
+            return self._missing_sid_text(sid)
 
         approved, reason = await self._require_approval(
             "dhapi_coding_leave_session", {"session_id": sid[:8]}, event
@@ -743,6 +763,8 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         sid, error = self._resolve_sid_text(event, session_id)
         if error:
             return error
+        if not self.validate_sid(sid):
+            return self._missing_sid_text(sid)
 
         # 请求审批
         approved, reason = await self._require_approval(
@@ -768,6 +790,8 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         sid, error = self._resolve_sid_text(event, session_id)
         if error:
             return error
+        if not self.validate_sid(sid):
+            return self._missing_sid_text(sid)
 
         approved, reason = await self._require_approval(
             "dhapi_coding_archive_session", {"session_id": sid[:8]}, event
@@ -790,6 +814,8 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         sid, error = self._resolve_sid_text(event, session_id)
         if error:
             return error
+        if not self.validate_sid(sid):
+            return self._missing_sid_text(sid)
 
         approved, reason = await self._require_approval(
             "dhapi_coding_delete_session", {"session_id": sid[:8]}, event

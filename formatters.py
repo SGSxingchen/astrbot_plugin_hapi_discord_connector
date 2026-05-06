@@ -851,7 +851,7 @@ HELP_COMMANDS = [
     {
         "topic": "session",
         "usage": "/dhapi",
-        "summary": "切换当前 session",
+        "summary": "在 /dhapi 面板加入/退出 session",
         "example": "/dhapi",
         "home": True,
     },
@@ -1033,7 +1033,7 @@ HELP_COMMANDS = [
     {
         "topic": "config",
         "usage": "/dhapi remote",
-        "summary": "切换当前 session 到 remote 托管模式",
+        "summary": "将指定 session 设为 remote 托管模式",
         "example": None,
         "home": True,
     },

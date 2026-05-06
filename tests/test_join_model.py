@@ -54,6 +54,7 @@ StateManager = state_mod.StateManager
 class KV:
     def __init__(self, initial=None):
         self.data = dict(initial or {})
+        self.deleted = []
 
     async def get_kv_data(self, key, default=None):
         return self.data.get(key, default)
@@ -63,6 +64,13 @@ class KV:
             self.data.pop(key, None)
         else:
             self.data[key] = value
+
+    async def delete_kv_data(self, key):
+        self.deleted.append(key)
+        self.data.pop(key, None)
+
+    async def list_keys(self, prefix=""):
+        return [key for key in self.data if key.startswith(prefix)]
 
 
 class Event:
@@ -130,3 +138,43 @@ def test_load_legacy_session_owners_str_and_list_upgrades_to_join_model():
     assert mgr.get_owners("sid-str") == ["umo-A"]
     assert mgr.get_owners("sid-list") == ["umo-B", "umo-C"]
     assert mgr.get_window_sessions("umo-C") == ["sid-list"]
+
+
+def test_select_notification_targets_multi_owner_dedup():
+    mgr = BindingManager()
+    sm = StateManager(KV(), mgr)
+    mgr._session_owners["sid-1"] = ["umo-A", "umo-B", "umo-A"]
+
+    targets = sm.select_notification_targets("sid-1", [{"id": "sid-1"}])
+
+    assert targets == ["umo-A", "umo-B"]
+
+
+def test_legacy_owner_state_migration_clears_kv():
+    kv = KV(
+        {
+            "dhapi_session_owners": {"sid-old": "umo-legacy"},
+            "dhapi_window_state_umo-legacy": {
+                "current_session": "sid-old",
+                "current_flavor": "codex",
+            },
+            "dhapi_primary_windows": [],
+            "dhapi_flavor_primary_windows": {},
+            "dhapi_known_users": [],
+        }
+    )
+    mgr = BindingManager()
+    sm = StateManager(kv, mgr)
+
+    asyncio.run(sm.load_all())
+    # Simulate a legacy key still present when the explicit migration runs.
+    kv.data["dhapi_window_state_umo-legacy"] = {
+        "current_session": "sid-old",
+        "current_flavor": "codex",
+    }
+    asyncio.run(sm.migrate_legacy_owner_state())
+
+    assert mgr.get_owners("sid-old") == ["umo-legacy"]
+    assert mgr.get_window_sessions("umo-legacy") == ["sid-old"]
+    assert "dhapi_window_state_umo-legacy" not in kv.data
+    assert "dhapi_window_state_umo-legacy" in kv.deleted
