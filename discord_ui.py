@@ -933,17 +933,20 @@ class SessionActionView(DhapiBaseView):
             f"**{_session_title(session)}**",
             _session_desc(session),
         ]
-        owners = self.plugin.binding_mgr.get_owners(self.sid)
-        if owners:
-            if len(owners) <= 2:
-                owner_text = ", ".join(_clip(owner, 40) for owner in owners)
-            else:
-                owner_text = ", ".join(_clip(owner, 30) for owner in owners[:2]) + f" +{len(owners) - 2}"
-            desc.append(f"订阅窗口：{owner_text}")
-        else:
-            desc.append("订阅窗口：0")
         if meta.get("path"):
             desc.append(f"路径：`{_clip(meta.get('path'), 500)}`")
+        owners = self.plugin.binding_mgr.get_owners(self.sid)
+        if owners:
+            shown = [
+                self.plugin.state_mgr.format_umo_for_display(umo, max_len=36)
+                for umo in owners[:3]
+            ]
+            owner_text = ", ".join(shown)
+            if len(owners) > 3:
+                owner_text = f"{owner_text} 等 {len(owners)} 个窗口"
+        else:
+            owner_text = "-"
+        desc.append(f"已加入窗口: {owner_text}")
         if note:
             desc.append(f"\n{note}")
         return make_embed("Session 操作", "\n".join(desc), BRAND)

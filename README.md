@@ -109,7 +109,7 @@ _✨ HAPI 远程 vibe coding 的 Discord 专用版 ✨_
 
 | 工具 | 说明 |
 |------|------|
-| `dhapi_coding_list_sessions` | 列出 session（支持窗口/路径/agent 过滤） |
+| `dhapi_coding_list_sessions(window="", path="", agent="", joined_only=false)` | 列出 session（支持窗口/路径/agent 过滤；`joined_only=true` 时仅列出当前窗口已加入的 session） |
 | `dhapi_coding_get_status(session_id="")` | 获取 session 状态 |
 | `dhapi_coding_message_history(rounds=1, session_id="")` | 查询历史消息 |
 | `dhapi_coding_get_config_status` | 查看插件配置 |

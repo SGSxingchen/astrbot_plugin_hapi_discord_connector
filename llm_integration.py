@@ -287,7 +287,12 @@ class LLMIntegration:
             return f"获取状态失败: {e}"
 
     async def tool_list_sessions(
-        self, event: AstrMessageEvent, window: str = "", path: str = "", agent: str = ""
+        self,
+        event: AstrMessageEvent,
+        window: str = "",
+        path: str = "",
+        agent: str = "",
+        joined_only: bool = False,
     ):
         """列出 HAPI 的可交互 session 列表。
 
@@ -295,21 +300,34 @@ class LLMIntegration:
             window(string): 按聊天窗口过滤（默认为空表示当前窗口，设为 'all' 查询所有聊天窗口，用户没有明确要求时一般置空）
             path(string): 按路径搜索
             agent(string): 按代理类型过滤（claude/codex/gemini/opencode）
+            joined_only(boolean): 仅列出当前 Discord 窗口已加入的 session
         """
-        # 当前窗口无session时，自动查询所有session
-        visible_sessions = self.state_mgr.visible_sessions_for_window(
-            event, self.sessions_cache
-        )
-        if not visible_sessions and window == "":
-            window = "all"
-            auto_switched = True
-        else:
+        if joined_only:
+            joined_sids = self.state_mgr.binding_mgr.get_window_sessions(
+                event.unified_msg_origin
+            )
+            by_sid = {
+                session.get("id"): session
+                for session in self.sessions_cache
+                if session.get("id")
+            }
+            sessions = [by_sid[sid] for sid in joined_sids if sid in by_sid]
             auto_switched = False
-
-        if window == "all":
-            sessions = self.sessions_cache
         else:
-            sessions = visible_sessions
+            # 当前窗口无session时，自动查询所有session
+            visible_sessions = self.state_mgr.visible_sessions_for_window(
+                event, self.sessions_cache
+            )
+            if not visible_sessions and window == "":
+                window = "all"
+                auto_switched = True
+            else:
+                auto_switched = False
+
+            if window == "all":
+                sessions = self.sessions_cache
+            else:
+                sessions = visible_sessions
 
         # 过滤
         if path:
@@ -337,6 +355,10 @@ class LLMIntegration:
             current_sid,
             self.sessions_cache,
             header_current_window=event.unified_msg_origin,
+            session_owners=self.state_mgr.binding_mgr.get_all_bindings(),
+            owner_formatter=lambda umo: self.state_mgr.format_umo_for_display(
+                umo, max_len=32
+            ),
         )
 
         # 替换 emoji 为文字

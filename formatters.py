@@ -307,6 +307,8 @@ def format_session_list(
     current_sid: str | None = None,
     all_sessions: list[dict] | None = None,
     header_current_window: str | None = None,
+    session_owners: dict[str, list[str]] | None = None,
+    owner_formatter=None,
 ) -> str:
     """格式化 session 列表；可选沿用全局 session 列表编号。"""
     if not sessions:
@@ -376,6 +378,17 @@ def format_session_list(
             parts.append(f"⚠️ {pending}待审批")
         if current_sid and sid == current_sid:
             parts.append("<<当前")
+        owners = (session_owners or {}).get(sid) or []
+        if owners:
+            if len(owners) <= 2:
+                formatter = owner_formatter or (lambda umo: str(umo))
+                parts.append(
+                    "(joined by: "
+                    + ", ".join(formatter(umo) for umo in owners)
+                    + ")"
+                )
+            else:
+                parts.append(f"(joined by {len(owners)} windows)")
         lines.append(" | ".join(parts))
 
     lines.append("\n💡 打开 /dhapi 面板切换会话")

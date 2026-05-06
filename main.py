@@ -213,7 +213,12 @@ class HapiDiscordConnectorPlugin(Star):
 
     @filter.llm_tool(name="dhapi_coding_list_sessions")
     async def tool_list_sessions(
-        self, event: AstrMessageEvent, window: str = "", path: str = "", agent: str = ""
+        self,
+        event: AstrMessageEvent,
+        window: str = "",
+        path: str = "",
+        agent: str = "",
+        joined_only: bool = False,
     ) -> str:
         """列出 Discord 当前频道可交互的 HAPI session。
 
@@ -221,10 +226,13 @@ class HapiDiscordConnectorPlugin(Star):
             window(string): 窗口过滤，空=当前 Discord 频道，all=所有频道。
             path(string): 按工作目录路径关键词过滤。
             agent(string): 按代理类型过滤，claude/codex/gemini/opencode。
+            joined_only(boolean): 为 true 时仅返回当前 Discord 窗口已加入的 session。
         """
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
-        return await self.llm_integration.tool_list_sessions(event, window, path, agent)
+        return await self.llm_integration.tool_list_sessions(
+            event, window, path, agent, joined_only
+        )
 
     @filter.llm_tool(name="dhapi_coding_message_history")
     async def tool_message_history(
