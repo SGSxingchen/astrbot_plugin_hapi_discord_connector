@@ -211,7 +211,7 @@ class AgentFinalTrigger:
         return True
 
     def _truncate(self, content: str) -> str:
-        max_chars = max(1, self._cfg_int("max_content_chars", 12000))
+        max_chars = max(1, self._cfg_int("max_content_chars", 1500))
         if len(content) <= max_chars:
             return content
         return content[:max_chars] + f"\n…(已截断，原始长度 {len(content)} 字符)"

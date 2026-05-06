@@ -113,7 +113,7 @@
   "max_content_chars": {
     "description": "agent final 内容最大注入字符数",
     "type": "int",
-    "default": 12000,
+    "default": 1500,
     "hint": "超过会截断，避免超长 final 塞爆上下文"
   },
   "agent_final_preview_chars": {

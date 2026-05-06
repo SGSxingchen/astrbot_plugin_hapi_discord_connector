@@ -369,7 +369,7 @@ class LLMIntegration:
             "enable_agent_final_trigger", False
         )
         trigger_agents = self.plugin.config.get("trigger_agents", ["codex"])
-        max_content_chars = self.plugin.config.get("max_content_chars", 12000)
+        max_content_chars = self.plugin.config.get("max_content_chars", 1500)
         final_preview_chars = self.plugin.config.get("agent_final_preview_chars", 240)
         final_file_ttl_days = self.plugin.config.get("agent_final_file_ttl_days", 7)
         final_use_file_when_chars = self.plugin.config.get(
