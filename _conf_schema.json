@@ -91,10 +91,10 @@
     "hint": "默认 0x5865F2（Discord 紫蓝）"
   },
   "enable_agent_final_trigger": {
-    "description": "DHAPI agent final 回包后触发 AstrBot 主链（默认关闭）",
+    "description": "DHAPI agent final 回包后注入 AstrBot 主链（默认关闭）",
     "type": "bool",
     "default": false,
-    "hint": "仅响应 HAPI 原始 SSE 完成事件中的 assistant final 消息；不会响应 Discord/AstrBot 自己输出"
+    "hint": "仅处理 HAPI 原始 SSE 完成事件中的 assistant final；不会响应 Discord/AstrBot 自己输出"
   },
   "trigger_agents": {
     "description": "允许触发主链的 agent 列表",
@@ -111,33 +111,33 @@
     "hint": "可使用 {content} 占位 agent final 内容"
   },
   "max_content_chars": {
-    "description": "agent final 内容最大注入字符数",
+    "description": "注入对话历史的最大字符数，超出会截断；磁盘备份文件始终保留完整原文，不受此项限制",
     "type": "int",
     "default": 1500,
-    "hint": "超过会截断，避免超长 final 塞爆上下文"
+    "hint": "只限制主链注入文本，不影响临时文件全文备份"
   },
   "agent_final_preview_chars": {
-    "description": "agent final 写文件时的预览字符数",
+    "description": "切到文件兜底模式时，主链中只注入这么多字符的预览片段",
     "type": "int",
     "default": 240,
-    "hint": "仅把短预览注入主链，避免记忆检索长查询"
+    "hint": "只影响预览长度，不影响临时文件全文"
   },
   "agent_final_file_ttl_days": {
-    "description": "agent final 临时文件保留天数",
+    "description": "临时文件保留天数，超出自动清理",
     "type": "int",
     "default": 7,
-    "hint": "触发时自动清理超过该天数的旧文件"
+    "hint": "用于清理 agent final 全文备份文件"
   },
   "agent_final_use_file_when_chars": {
-    "description": "agent final 超过多少字符时写入临时文件",
+    "description": "agent final 内容超过这个字符数时，只把预览注入主链，完整原文写入临时文件由 LLM 按需读取",
     "type": "int",
     "default": 800,
-    "hint": "低于该长度直接注入完整文本"
+    "hint": "低于该长度直接注入主链文本；高于该长度启用文件兜底"
   },
   "dedupe_ttl_seconds": {
-    "description": "agent final event_id 去重 TTL（秒）",
+    "description": "event_id 去重 TTL，避免 SSE 重连/重放导致同一条 final 被重复触发",
     "type": "int",
     "default": 3600,
-    "hint": "避免 SSE 重连或重复 poll 导致重复触发"
+    "hint": "单位秒；仅用于 agent final event_id 去重"
   }
 }

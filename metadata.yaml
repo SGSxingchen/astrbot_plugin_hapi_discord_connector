@@ -1,7 +1,7 @@
 name: astrbot_plugin_hapi_discord_connector
 display_name: HAPI Discord Connector
 desc: "仅支持 Discord 的 HAPI coding session 管理插件：/dhapi 原生 Embed/Button/Select 面板与 dhapi_coding_* 审批工具；要求 Python 3.10+、AstrBot 3.4+。"
-version: v1.3.1
+version: v1.3.2
 author: SGSxingchen
 repo: https://github.com/SGSxingchen/astrbot_plugin_hapi_discord_connector
 support_platforms:

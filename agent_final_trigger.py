@@ -37,38 +37,21 @@ class AgentFinalTrigger:
     """Build and enqueue synthetic user events for agent final messages."""
 
     SOURCE = "dhapi_agent"
-    _RECOVERABLE_CONTEXT_MARKERS = (
-        "NoneType' object has no attribute 'get_channel",
-        "Discord client missing",
-        "live Discord client unavailable",
-    )
 
     def __init__(self, plugin):
         self.plugin = plugin
-        # umo -> last real Discord event seen in this plugin.  Used to preserve
-        # sender/channel/client details for the synthetic message.
-        self._event_cache: dict[str, Any] = {}
+        self._remember_event_warned = False
         # event_id -> monotonic timestamp.  In-memory TTL is enough to suppress
         # SSE reconnect / repeated poll replays within a plugin generation.
         self._dedupe: dict[str, float] = {}
 
     def remember_event(self, event) -> None:
-        """Remember a real Discord event as a template for future synthetic events."""
-        try:
-            if event.get_platform_name() != "discord":
-                return
-            umo = str(event.unified_msg_origin or "")
-            if not umo:
-                return
-            # Never cache our own synthetic events.
-            if event.get_extra("synthetic", False) or event.get_extra("source") == self.SOURCE:
-                return
-            is_admin = self.plugin._is_admin(event)
-            if not is_admin:
-                return
-            self._event_cache[umo] = event
-        except Exception as exc:
-            logger.debug("[dhapi] remember_event skipped: %s", exc)
+        """Compatibility stub: agent final events are always built from scratch."""
+        if not self._remember_event_warned:
+            self._remember_event_warned = True
+            logger.warning(
+                "[dhapi] agent final remember_event is disabled; using fallback-only synthetic events"
+            )
 
     def _cfg_bool(self, key: str, default: bool) -> bool:
         try:
@@ -173,17 +156,19 @@ class AgentFinalTrigger:
         not receive the whole assistant final as a retrieval query.
         """
         content = self._truncate(payload.content)
+        injected_truncated = content != payload.content
         self._cleanup_agent_final_files()
         use_file_at = max(1, self._cfg_int("agent_final_use_file_when_chars", 800))
         meta: dict[str, Any] = {
             "dhapi_final_chars": len(payload.content),
+            "dhapi_final_truncated": injected_truncated,
         }
         if len(content) < use_file_at:
             meta["dhapi_final_preview_chars"] = len(content)
             return content, meta
 
         preview = self._preview(content)
-        file_path = self._write_agent_final_file(payload, content)
+        file_path = self._write_agent_final_file(payload, payload.content)
         meta.update(
             {
                 "dhapi_final_file": file_path,
@@ -251,11 +236,6 @@ class AgentFinalTrigger:
             raise RuntimeError(f"live Discord client unavailable for synthetic event umo={umo}")
 
         return session, platform, client
-
-    @classmethod
-    def _is_recoverable_context_error(cls, exc: Exception) -> bool:
-        text = f"{type(exc).__name__}: {exc}"
-        return any(marker in text for marker in cls._RECOVERABLE_CONTEXT_MARKERS)
 
     @staticmethod
     def _validate_event_send_context(event, target_umo: str) -> None:
@@ -360,37 +340,6 @@ class AgentFinalTrigger:
         )
         return msg
 
-    def _build_from_cached_event(
-        self,
-        base_event,
-        target_umo: str,
-        text: str,
-        payload: AgentFinalPayload,
-        final_meta: dict[str, Any] | None = None,
-    ):
-        # Normal cached-event path, with key Discord context refreshed from the
-        # explicitly-typed live DiscordPlatformAdapter.
-        session, platform, client = self._live_discord_context(target_umo)
-        event = copy.copy(base_event)
-        event._extras = dict(base_event._extras)
-        event.client = client
-        event.platform_meta = platform.meta()
-        event.unified_msg_origin = target_umo
-        event.session_id = session.session_id
-        event.message_str = text
-        event.message_obj = self._build_message_obj(
-            session=session,
-            platform=platform,
-            text=text,
-            payload=payload,
-            target_umo=target_umo,
-            final_meta=final_meta,
-            base_message_obj=base_event.message_obj,
-        )
-        self._refresh_event_flags(event, payload, final_meta)
-        self._validate_event_send_context(event, target_umo)
-        return event
-
     def _build_fallback_event(
         self,
         umo: str,
@@ -421,34 +370,6 @@ class AgentFinalTrigger:
         )
         self._refresh_event_flags(event, payload, final_meta)
         self._validate_event_send_context(event, umo)
-        return event
-
-    def _recover_event_context(
-        self,
-        text: str,
-        payload: AgentFinalPayload,
-        reason: Exception,
-        target_umo: str,
-        final_meta: dict[str, Any] | None = None,
-    ):
-        """One-shot recovery for missing cached event Discord context.
-
-        Recovery is still main-architecture friendly: it rebuilds a normal
-        DiscordPlatformEvent from payload.session_id -> target_umo -> live
-        DiscordPlatformAdapter and enqueues it like any other event.
-        """
-        if not target_umo:
-            raise RuntimeError(
-                f"recovery failed: no target umo for sid={payload.session_id[:8]}"
-            ) from reason
-        logger.warning(
-            "[dhapi] recovering synthetic agent-final Discord context sid=%s umo=%s reason=%s",
-            payload.session_id[:8],
-            target_umo,
-            reason,
-        )
-        event = self._build_fallback_event(target_umo, text, payload, final_meta)
-        self._validate_event_send_context(event, target_umo)
         return event
 
     async def trigger(self, payload: AgentFinalPayload) -> None:
@@ -490,36 +411,37 @@ class AgentFinalTrigger:
             if umo in queued:
                 continue
             queued.add(umo)
-            base_event = self._event_cache.get(umo)
+            path = "fallback"
+            event_cache_hit = False
+            base_event_id = None
             try:
-                if base_event is not None:
-                    event = self._build_from_cached_event(
-                        base_event, umo, text, payload, final_meta
-                    )
-                else:
-                    event = self._build_fallback_event(umo, text, payload, final_meta)
+                event = self._build_fallback_event(umo, text, payload, final_meta)
             except Exception as exc:
-                if not self._is_recoverable_context_error(exc):
-                    logger.warning(
-                        "[dhapi] agent final trigger skipped sid=%s event_id=%s umo=%s: %s",
-                        payload.session_id[:8],
-                        payload.event_id,
-                        umo,
-                        exc,
-                    )
-                    continue
-                try:
-                    event = self._recover_event_context(text, payload, exc, umo, final_meta)
-                except Exception as recover_exc:
-                    logger.warning(
-                        "[dhapi] agent final trigger recovery failed sid=%s event_id=%s umo=%s: %s",
-                        payload.session_id[:8],
-                        payload.event_id,
-                        umo,
-                        recover_exc,
-                    )
-                    continue
+                logger.warning(
+                    "[dhapi] agent final trigger skipped sid=%s event_id=%s umo=%s: %s",
+                    payload.session_id[:8],
+                    payload.event_id,
+                    umo,
+                    exc,
+                )
+                continue
 
+            synthetic_message_id = getattr(
+                getattr(event, "message_obj", None), "message_id", None
+            )
+            final_meta_keys = list((final_meta or {}).keys())
+            logger.info(
+                "[dhapi] agent final trigger path=%s event_id=%s sid=%s umo=%s text_len=%s event_cache_hit=%s base_event_id=%s synthetic_message_id=%s final_meta_keys=%s",
+                path,
+                payload.event_id,
+                payload.session_id[:8],
+                umo,
+                len(text),
+                event_cache_hit,
+                base_event_id,
+                synthetic_message_id,
+                final_meta_keys,
+            )
             try:
                 self.plugin.context.get_event_queue().put_nowait(event)
                 logger.info(
@@ -529,7 +451,19 @@ class AgentFinalTrigger:
                     payload.event_id,
                     umo,
                     len(text),
-                    base_event is not None,
+                    False,
+                )
+                logger.info(
+                    "[dhapi] agent final trigger enqueued path=%s event_id=%s sid=%s umo=%s text_len=%s event_cache_hit=%s base_event_id=%s synthetic_message_id=%s final_meta_keys=%s",
+                    path,
+                    payload.event_id,
+                    payload.session_id[:8],
+                    umo,
+                    len(text),
+                    event_cache_hit,
+                    base_event_id,
+                    synthetic_message_id,
+                    final_meta_keys,
                 )
             except Exception as exc:
                 logger.warning(

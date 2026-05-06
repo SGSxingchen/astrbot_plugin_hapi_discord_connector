@@ -1,5 +1,12 @@
 # 更新日志
 
+## v1.3.2 — DHAPI agent final 注入修复
+
+1. 修复 agent final cached 路径偶发吞正文导致对话历史只剩 `<system_reminder>` 时间戳壳的问题；synthetic event 统一走 fallback 从 0 构造 `DiscordPlatformEvent`，不再复用 base_event 的 `_extras` / `message_obj`。
+2. 修复 agent final 临时 md 文件被 `max_content_chars` 截断的问题；磁盘备份文件始终写入完整原文。
+3. `_conf_schema.json` 中 agent final 相关配置项的 description / hint 文案重写，明确"主链截断 ≠ 文件保留 ≠ 预览长度"。
+4. `agent_final_trigger.py` 删除 `_event_cache` / `_build_from_cached_event` / `_recover_event_context` / `_is_recoverable_context_error`；`remember_event` 保留为兼容 stub。
+
 ## v1.1.0 — DHAPI agent final 自动触发主链
 
 1. 新增 `enable_agent_final_trigger` 配置项，支持在 HAPI/Codex assistant final 回包后触发 AstrBot 主链。
