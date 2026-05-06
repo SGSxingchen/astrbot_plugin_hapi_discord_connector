@@ -1,5 +1,7 @@
 """用户状态和通知窗口订阅管理"""
 
+import inspect
+
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
@@ -26,14 +28,62 @@ class StateManager:
         """持久化 session -> 多窗口订阅关系。"""
         await self.kv.put_kv_data("dhapi_session_owners", self.binding_mgr.get_all_bindings())
 
+    async def _delete_kv_key(self, key: str):
+        """删除 KV key；优先使用 delete_kv_data，兼容旧 KV helper 的 put None。"""
+        delete = getattr(self.kv, "delete_kv_data", None)
+        if callable(delete):
+            result = delete(key)
+            if inspect.isawaitable(result):
+                await result
+            return
+        await self.kv.put_kv_data(key, None)
+
+    async def _list_legacy_window_state_keys(self, known_umos: list[str]) -> list[str]:
+        """列出旧 dhapi_window_state_* key。
+
+        AstrBot KV 若提供 list_keys/list_kv_keys/get_kv_keys 就按 prefix 真删除；
+        否则只能删除本次迁移能从 owner/known_chats/default windows 推导出的固定 key。
+        测试 KV 暴露 data 时也按 prefix 扫描。
+        """
+        keys: list[str] = []
+        seen: set[str] = set()
+
+        def add(key: str):
+            if key.startswith("dhapi_window_state_") and key not in seen:
+                seen.add(key)
+                keys.append(key)
+
+        for umo in known_umos:
+            target = str(umo or "").strip()
+            if target:
+                add(f"dhapi_window_state_{target}")
+
+        for method_name in ("list_keys", "list_kv_keys", "get_kv_keys"):
+            method = getattr(self.kv, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                result = method("dhapi_window_state_")
+            except TypeError:
+                result = method()
+            if inspect.isawaitable(result):
+                result = await result
+            if isinstance(result, list):
+                for key in result:
+                    add(str(key))
+                return keys
+
+        data = getattr(self.kv, "data", None)
+        if isinstance(data, dict):
+            for key in data.keys():
+                add(str(key))
+
+        return keys
+
     async def _delete_known_window_state_keys(self, umos: list[str]):
         """尽力清理旧的 dhapi_window_state_{umo} KV。"""
-        seen: set[str] = set()
-        for umo in umos:
-            target = str(umo or "").strip()
-            if target and target not in seen:
-                seen.add(target)
-                await self.kv.put_kv_data(f"dhapi_window_state_{target}", None)
+        for key in await self._list_legacy_window_state_keys(umos):
+            await self._delete_kv_key(key)
 
     # ──── Session 订阅 ────
 
@@ -373,7 +423,7 @@ class StateManager:
             uid = str(uid)
             state = await self.kv.get_kv_data(f"dhapi_user_state_{uid}", None)
             if isinstance(state, dict):
-                # 旧 current_* 字段只在 migrate_to_capture_model 中处理；运行态不再使用。
+                # 旧 current_* 字段只在 migrate_legacy_owner_state 中处理；运行态不再使用。
                 self._user_states_cache[uid] = state
 
         stored_session_owners = await self.kv.get_kv_data("dhapi_session_owners", {})
@@ -404,9 +454,10 @@ class StateManager:
 
         await self.persist_notification_windows_index()
 
-    async def migrate_to_capture_model(self):
-        """数据迁移：旧绑定/current_session 模型 → join/leave 订阅模型。"""
+    async def migrate_legacy_owner_state(self):
+        """数据迁移：旧 owner/current_session 状态 → join/leave 多对多订阅模型。"""
         migrated = False
+        legacy_umos: list[str] = []
 
         for uid, state in list(self._user_states_cache.items()):
             modified = False
@@ -428,6 +479,7 @@ class StateManager:
                 if owners:
                     target_umo = owners[-1]
                 if target_umo:
+                    legacy_umos.append(str(target_umo))
                     self.binding_mgr.join(str(old_session), str(target_umo), str(old_flavor))
                     migrated = True
                     logger.info(
@@ -451,10 +503,15 @@ class StateManager:
         known_chats = await self.kv.get_kv_data("dhapi_known_chats", [])
         if known_chats:
             for umo in known_chats:
-                await self.kv.put_kv_data(f"dhapi_chat_binding_{umo}", None)
-            await self._delete_known_window_state_keys([str(umo) for umo in known_chats])
+                await self._delete_kv_key(f"dhapi_chat_binding_{umo}")
+            legacy_umos.extend(str(umo) for umo in known_chats)
             logger.info("已清理 %d 个废弃的 chat_binding/window_state 数据", len(known_chats))
             migrated = True
+
+        legacy_umos.extend(self.get_primary_windows())
+        for owners in self.binding_mgr._session_owners.values():
+            legacy_umos.extend(owners)
+        await self._delete_known_window_state_keys(legacy_umos)
 
         if migrated:
             await self.persist_session_owners()

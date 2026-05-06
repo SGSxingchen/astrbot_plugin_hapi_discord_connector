@@ -439,7 +439,7 @@ class HapiDiscordConnectorPlugin(Star):
         await self.state_mgr.load_all()
 
         # 执行数据迁移
-        await self.state_mgr.migrate_to_capture_model()
+        await self.state_mgr.migrate_legacy_owner_state()
 
         # 加载 session 缓存
         try:
