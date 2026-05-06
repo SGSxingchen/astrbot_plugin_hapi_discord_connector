@@ -85,7 +85,7 @@ _✨ HAPI 远程 vibe coding 的 Discord 专用版 ✨_
 
 `/dhapi` 打开后的主面板包含：
 
-- **Session 列表**：选择 session 后切换、查看状态、停止生成、删除、归档、返回
+- **Session 列表**：选择 session 后加入/退出当前窗口订阅、查看状态、停止生成、删除、归档、返回
 - **当前状态**：当前绑定 session 的 flavor / 路径 / 模型 / 权限模式 / 思考状态
 - **审批面板**：选择 pending request 后批准、拒绝、批准全部、刷新、返回；审批通知优先使用 Embed + 原生 Discord 按钮，可直接批准/拒绝/打开审批面板，异常时保留 pending 并降级提示
 - **创建 session**：Select 分步选 machine / agent / session_type / yolo / reasoning_effort，仅目录走 Modal
@@ -97,7 +97,8 @@ _✨ HAPI 远程 vibe coding 的 Discord 专用版 ✨_
 
 - 按 Discord 频道（私聊 / 服务器频道）隔离 session 通知
 - 支持默认通知频道、按 agent 类型分别绑定默认频道
-- session 一旦被某个频道接管，后续通知优先回到该频道
+- session 可被多个 Discord 窗口加入订阅，后续通知会去重后群发到所有已加入窗口
+- 操作和订阅脱钩：LLM/按钮可以显式指定 session 操作；加入/退出只影响通知订阅
 - SSE 推送级别 silence / simple / summary / detail 与上游一致
 
 ---
@@ -109,17 +110,20 @@ _✨ HAPI 远程 vibe coding 的 Discord 专用版 ✨_
 | 工具 | 说明 |
 |------|------|
 | `dhapi_coding_list_sessions` | 列出 session（支持窗口/路径/agent 过滤） |
-| `dhapi_coding_get_status` | 获取当前 session 状态 |
-| `dhapi_coding_message_history` | 查询历史消息 |
+| `dhapi_coding_get_status(session_id="")` | 获取 session 状态 |
+| `dhapi_coding_message_history(rounds=1, session_id="")` | 查询历史消息 |
 | `dhapi_coding_get_config_status` | 查看插件配置 |
 | `dhapi_coding_list_commands` | 列出可用操作（按主题分类） |
-| `dhapi_coding_send_message` | 向当前 session 发送消息（需审批） |
-| `dhapi_coding_switch_session` | 切换 session（需审批） |
+| `dhapi_coding_send_message(message, session_id="")` | 向 session 发送消息（需审批） |
+| `dhapi_coding_join_session(session_id)` | 在当前 Discord 窗口加入 session 订阅（需审批） |
+| `dhapi_coding_leave_session(session_id="")` | 从当前 Discord 窗口退出 session 订阅（需审批） |
 | `dhapi_coding_create_session` | 创建新 session（需审批） |
-| `dhapi_coding_stop_message` | 停止当前消息生成（需审批） |
-| `dhapi_coding_archive_session` | 归档当前 session（危险，需审批） |
-| `dhapi_coding_delete_session` | 删除当前 session（危险，需审批） |
+| `dhapi_coding_stop_message(session_id="")` | 停止消息生成（需审批） |
+| `dhapi_coding_archive_session(session_id="")` | 归档 session（危险，需审批） |
+| `dhapi_coding_delete_session(session_id="")` | 删除 session（危险，需审批） |
 | `dhapi_coding_change_config` | 修改插件配置 |
+
+`session_id` 不传时只是便捷糖：只有当前 Discord 窗口刚好加入了 1 个 session 才会自动使用它；未加入会提示先 `dhapi_coding_join_session(session_id)`，已加入多个会返回短列表并要求下一轮显式传 `session_id`。
 
 操作类工具的审批入口与文本流分离：LLM 工具发起操作时会在当前 Discord 窗口发送 **Embed + 原生按钮**，可直接点击“批准 / 拒绝 / 打开审批面板”，也可进入 `/dhapi` 审批页处理。
 
