@@ -216,11 +216,10 @@ class AgentFinalTrigger:
             return content
         return content[:max_chars] + f"\n…(已截断，原始长度 {len(content)} 字符)"
 
-    def _target_umo(self, session_id: str) -> str | None:
-        targets = self.plugin.state_mgr.select_notification_targets(
+    def _target_umos(self, session_id: str) -> list[str]:
+        return self.plugin.state_mgr.select_notification_targets(
             session_id, self.plugin.sessions_cache
         )
-        return targets[0] if targets else None
 
     def _find_discord_platform(self, platform_id: str) -> DiscordPlatformAdapter | None:
         for platform in self.plugin.context.platform_manager.platform_insts:
@@ -429,6 +428,7 @@ class AgentFinalTrigger:
         text: str,
         payload: AgentFinalPayload,
         reason: Exception,
+        target_umo: str,
         final_meta: dict[str, Any] | None = None,
     ):
         """One-shot recovery for missing cached event Discord context.
@@ -437,7 +437,6 @@ class AgentFinalTrigger:
         DiscordPlatformEvent from payload.session_id -> target_umo -> live
         DiscordPlatformAdapter and enqueues it like any other event.
         """
-        target_umo = self._target_umo(payload.session_id)
         if not target_umo:
             raise RuntimeError(
                 f"recovery failed: no target umo for sid={payload.session_id[:8]}"
@@ -468,8 +467,8 @@ class AgentFinalTrigger:
             )
             return
 
-        umo = self._target_umo(payload.session_id)
-        if not umo:
+        targets = self._target_umos(payload.session_id)
+        if not targets:
             logger.warning(
                 "[dhapi] agent final trigger skipped: no target umo sid=%s",
                 payload.session_id[:8],
@@ -486,52 +485,57 @@ class AgentFinalTrigger:
                 exc,
             )
             return
-        base_event = self._event_cache.get(umo)
-        try:
-            if base_event is not None:
-                event = self._build_from_cached_event(
-                    base_event, umo, text, payload, final_meta
+        queued: set[str] = set()
+        for umo in targets:
+            if umo in queued:
+                continue
+            queued.add(umo)
+            base_event = self._event_cache.get(umo)
+            try:
+                if base_event is not None:
+                    event = self._build_from_cached_event(
+                        base_event, umo, text, payload, final_meta
+                    )
+                else:
+                    event = self._build_fallback_event(umo, text, payload, final_meta)
+            except Exception as exc:
+                if not self._is_recoverable_context_error(exc):
+                    logger.warning(
+                        "[dhapi] agent final trigger skipped sid=%s event_id=%s umo=%s: %s",
+                        payload.session_id[:8],
+                        payload.event_id,
+                        umo,
+                        exc,
+                    )
+                    continue
+                try:
+                    event = self._recover_event_context(text, payload, exc, umo, final_meta)
+                except Exception as recover_exc:
+                    logger.warning(
+                        "[dhapi] agent final trigger recovery failed sid=%s event_id=%s umo=%s: %s",
+                        payload.session_id[:8],
+                        payload.event_id,
+                        umo,
+                        recover_exc,
+                    )
+                    continue
+
+            try:
+                self.plugin.context.get_event_queue().put_nowait(event)
+                logger.info(
+                    "[dhapi] queued synthetic agent-final event sid=%s agent=%s event_id=%s umo=%s text_len=%s base_event=%s",
+                    payload.session_id[:8],
+                    agent,
+                    payload.event_id,
+                    umo,
+                    len(text),
+                    base_event is not None,
                 )
-            else:
-                event = self._build_fallback_event(umo, text, payload, final_meta)
-        except Exception as exc:
-            if not self._is_recoverable_context_error(exc):
+            except Exception as exc:
                 logger.warning(
-                    "[dhapi] agent final trigger skipped sid=%s event_id=%s umo=%s: %s",
+                    "[dhapi] agent final trigger enqueue failed sid=%s event_id=%s umo=%s: %s",
                     payload.session_id[:8],
                     payload.event_id,
                     umo,
                     exc,
                 )
-                return
-            try:
-                event = self._recover_event_context(text, payload, exc, final_meta)
-            except Exception as recover_exc:
-                logger.warning(
-                    "[dhapi] agent final trigger recovery failed sid=%s event_id=%s umo=%s: %s",
-                    payload.session_id[:8],
-                    payload.event_id,
-                    umo,
-                    recover_exc,
-                )
-                return
-
-        try:
-            self.plugin.context.get_event_queue().put_nowait(event)
-            logger.info(
-                "[dhapi] queued synthetic agent-final event sid=%s agent=%s event_id=%s umo=%s text_len=%s base_event=%s",
-                payload.session_id[:8],
-                agent,
-                payload.event_id,
-                umo,
-                len(text),
-                base_event is not None,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[dhapi] agent final trigger enqueue failed sid=%s event_id=%s umo=%s: %s",
-                payload.session_id[:8],
-                payload.event_id,
-                umo,
-                exc,
-            )

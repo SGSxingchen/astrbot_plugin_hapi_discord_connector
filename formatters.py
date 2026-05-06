@@ -247,10 +247,9 @@ def group_sessions_by_path(sessions: list[dict]) -> dict[str, list[dict]]:
 
 def format_bind_status(
     sessions: list[dict],
-    session_owners: dict[str, str],
-    window_states: dict[str, dict] = None,
+    session_owners: dict[str, list[str]],
 ) -> str:
-    """格式化全局绑定状态（复用 session 列表格式 + 绑定信息 + 窗口状态）"""
+    """格式化全局 session 订阅状态。"""
     if not sessions:
         return "没有任何 session"
 
@@ -290,24 +289,13 @@ def format_bind_status(
         if pending:
             parts.append(f"⚠️ {pending}待审批")
 
-        # 添加绑定信息
-        owner = session_owners.get(sid)
-        if owner:
-            owner_display = owner[:20] + "..." if len(owner) > 20 else owner
-            parts.append(f"📌{owner_display}")
-
-        # 添加窗口状态（显示当前活跃交互的窗口）
-        if window_states:
-            active_umo = next(
-                (
-                    umo
-                    for umo, state in window_states.items()
-                    if state.get("current_session") == sid
-                ),
-                None,
-            )
-            if active_umo:
-                parts.append("🪟正在交互")
+        owners = session_owners.get(sid) or []
+        if owners:
+            if len(owners) == 1:
+                owner_display = owners[0][:20] + "..." if len(owners[0]) > 20 else owners[0]
+                parts.append(f"📌{owner_display}")
+            else:
+                parts.append(f"📌{len(owners)}个窗口")
 
         lines.append(" | ".join(parts))
 
@@ -319,6 +307,8 @@ def format_session_list(
     current_sid: str | None = None,
     all_sessions: list[dict] | None = None,
     header_current_window: str | None = None,
+    session_owners: dict[str, list[str]] | None = None,
+    owner_formatter=None,
 ) -> str:
     """格式化 session 列表；可选沿用全局 session 列表编号。"""
     if not sessions:
@@ -388,6 +378,17 @@ def format_session_list(
             parts.append(f"⚠️ {pending}待审批")
         if current_sid and sid == current_sid:
             parts.append("<<当前")
+        owners = (session_owners or {}).get(sid) or []
+        if owners:
+            if len(owners) <= 2:
+                formatter = owner_formatter or (lambda umo: str(umo))
+                parts.append(
+                    "(joined by: "
+                    + ", ".join(formatter(umo) for umo in owners)
+                    + ")"
+                )
+            else:
+                parts.append(f"(joined by {len(owners)} windows)")
         lines.append(" | ".join(parts))
 
     lines.append("\n💡 打开 /dhapi 面板切换会话")
@@ -850,7 +851,7 @@ HELP_COMMANDS = [
     {
         "topic": "session",
         "usage": "/dhapi",
-        "summary": "切换当前 session",
+        "summary": "在 /dhapi 面板加入/退出 session",
         "example": "/dhapi",
         "home": True,
     },
@@ -1032,7 +1033,7 @@ HELP_COMMANDS = [
     {
         "topic": "config",
         "usage": "/dhapi remote",
-        "summary": "切换当前 session 到 remote 托管模式",
+        "summary": "将指定 session 设为 remote 托管模式",
         "example": None,
         "home": True,
     },

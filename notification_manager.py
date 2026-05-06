@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 import time
 from typing import Any
 
@@ -278,7 +279,8 @@ class NotificationManager:
             lines = lines[3:]
         elif lines and lines[0].startswith("🏷️ "):
             lines = lines[1:]
-        return "\n".join(line.rstrip() for line in lines).strip() or text.strip()
+        normalized = "\n".join(line.rstrip() for line in lines).strip() or text.strip()
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
     @staticmethod
     def is_request_notification(text: str) -> bool:
@@ -295,8 +297,8 @@ class NotificationManager:
             if ts < expire_before:
                 self._recent_notifications.pop(key, None)
 
-        body_key = self.notification_body_key(text)
-        cache_key = (umo, session_id or "", body_key)
+        body_hash = self.notification_body_key(text)
+        cache_key = (umo, session_id or "", body_hash)
         last_sent = self._recent_notifications.get(cache_key)
         if last_sent is not None and now - last_sent <= dedupe_window:
             logger.info(

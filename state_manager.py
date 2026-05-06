@@ -1,4 +1,6 @@
-"""用户状态和通知窗口绑定管理"""
+"""用户状态和通知窗口订阅管理"""
+
+import inspect
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
@@ -9,15 +11,13 @@ NOTIFICATION_ROUTE_FLAVORS = ("claude", "codex", "gemini")
 
 
 class StateManager:
-    """管理用户状态、通知窗口绑定、路由"""
+    """管理用户状态、session join/leave 订阅、通知路由。"""
 
     def __init__(self, kv_helper, binding_mgr: BindingManager):
         self.kv = kv_helper
         self.binding_mgr = binding_mgr
         self._user_states_cache: dict[str, dict] = {}
         # Persisted, user-independent index of known notification windows.
-        # This keeps fallback routing stable even if dhapi_known_users is missing
-        # or a plugin reload happens before a user opens /dhapi again.
         self._primary_windows_cache: list[str] = []
         self._flavor_primary_windows_cache: dict[str, list[str]] = {}
         self._session_owners = binding_mgr._session_owners
@@ -25,46 +25,102 @@ class StateManager:
     # ──── 持久化 ────
 
     async def persist_session_owners(self):
-        """持久化 session -> 窗口路由"""
-        await self.kv.put_kv_data("dhapi_session_owners", self._session_owners)
+        """持久化 session -> 多窗口订阅关系。"""
+        await self.kv.put_kv_data("dhapi_session_owners", self.binding_mgr.get_all_bindings())
 
-    async def persist_window_state(self, umo: str):
-        """持久化单个窗口状态；不存在时删除对应 KV"""
-        window_state = self.binding_mgr._window_states.get(umo)
-        await self.kv.put_kv_data(
-            f"dhapi_window_state_{umo}", window_state if window_state else None
-        )
+    async def _delete_kv_key(self, key: str):
+        """删除 KV key；优先使用 delete_kv_data，兼容旧 KV helper 的 put None。"""
+        delete = getattr(self.kv, "delete_kv_data", None)
+        if callable(delete):
+            result = delete(key)
+            if inspect.isawaitable(result):
+                await result
+            return
+        await self.kv.put_kv_data(key, None)
 
-    # ──── 通知窗口绑定 ────
+    async def _list_legacy_window_state_keys(self, known_umos: list[str]) -> list[str]:
+        """列出旧 dhapi_window_state_* key。
 
-    async def capture_window(self, session_id: str, umo: str, flavor: str):
-        """将 session 捕获到当前窗口，并释放旧窗口上的同 session 绑定"""
-        old_owner = self.binding_mgr.get_owners(session_id)
-        released_umos = self.binding_mgr.bind_window(session_id, umo, flavor)
+        AstrBot KV 若提供 list_keys/list_kv_keys/get_kv_keys 就按 prefix 真删除；
+        否则只能删除本次迁移能从 owner/known_chats/default windows 推导出的固定 key。
+        测试 KV 暴露 data 时也按 prefix 扫描。
+        """
+        keys: list[str] = []
+        seen: set[str] = set()
+
+        def add(key: str):
+            if key.startswith("dhapi_window_state_") and key not in seen:
+                seen.add(key)
+                keys.append(key)
+
+        for umo in known_umos:
+            target = str(umo or "").strip()
+            if target:
+                add(f"dhapi_window_state_{target}")
+
+        for method_name in ("list_keys", "list_kv_keys", "get_kv_keys"):
+            method = getattr(self.kv, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                result = method("dhapi_window_state_")
+            except TypeError:
+                result = method()
+            if inspect.isawaitable(result):
+                result = await result
+            if isinstance(result, list):
+                for key in result:
+                    add(str(key))
+                return keys
+
+        data = getattr(self.kv, "data", None)
+        if isinstance(data, dict):
+            for key in data.keys():
+                add(str(key))
+
+        return keys
+
+    async def _delete_known_window_state_keys(self, umos: list[str]):
+        """尽力清理旧的 dhapi_window_state_{umo} KV。"""
+        for key in await self._list_legacy_window_state_keys(umos):
+            await self._delete_kv_key(key)
+
+    # ──── Session 订阅 ────
+
+    async def join_session(self, session_id: str, umo: str, flavor: str):
+        """当前窗口加入 session 订阅；操作和通知订阅不再独占。"""
+        self.binding_mgr.join(session_id, umo, flavor)
         logger.info(
-            "[dhapi] capture_window sid=%s umo=%s flavor=%s old_owner=%s",
-            session_id[:8],
+            "[dhapi] join_session sid=%s umo=%s flavor=%s owners=%s",
+            session_id[:8] if session_id else "",
             umo,
             flavor,
-            old_owner[-1] if old_owner else "",
+            self.binding_mgr.get_owners(session_id),
         )
         await self.persist_session_owners()
-        for released_umo in released_umos:
-            await self.persist_window_state(released_umo)
-        await self.persist_window_state(umo)
 
-    async def unbind_window(self, umo: str):
-        """解除窗口当前 session 绑定"""
-        self.binding_mgr.unbind_window(umo)
+    async def leave_session(self, session_id: str, umo: str):
+        """窗口退出指定 session 订阅。"""
+        self.binding_mgr.leave(session_id, umo)
+        logger.info(
+            "[dhapi] leave_session sid=%s umo=%s owners=%s",
+            session_id[:8] if session_id else "",
+            umo,
+            self.binding_mgr.get_owners(session_id),
+        )
         await self.persist_session_owners()
-        await self.persist_window_state(umo)
 
-    async def unbind_session(self, session_id: str):
-        """解除 session 当前绑定窗口"""
-        released_umos = self.binding_mgr.unbind_session(session_id)
+    async def leave_window(self, umo: str):
+        """窗口退出所有 session 订阅。"""
+        self.binding_mgr.leave_window(umo)
         await self.persist_session_owners()
-        for released_umo in released_umos:
-            await self.persist_window_state(released_umo)
+        await self._delete_known_window_state_keys([umo])
+
+    async def leave_all_session_owners(self, session_id: str):
+        """session 被所有窗口退出；通常在删除/归档后调用。"""
+        released_umos = self.binding_mgr.leave_session(session_id)
+        await self.persist_session_owners()
+        await self._delete_known_window_state_keys(released_umos)
 
     # ──── 用户状态 ────
 
@@ -90,7 +146,7 @@ class StateManager:
             await self.kv.put_kv_data("dhapi_known_users", known)
 
     async def ensure_primary_session(self, event: AstrMessageEvent):
-        """确保用户已有默认通知窗口；仅首次自动设置，不迁移现有窗口绑定"""
+        """确保用户已有默认通知窗口；仅首次自动设置。"""
         sender_id = str(event.get_sender_id())
         umo = event.unified_msg_origin
         state = self._user_states_cache.get(sender_id, {})
@@ -107,35 +163,17 @@ class StateManager:
     async def set_primary_window(self, event: AstrMessageEvent, umo: str | None = None):
         """显式设置当前用户的主通知窗口。"""
         target_umo = umo or event.unified_msg_origin
-        # Capture the user's currently effective session before changing the
-        # primary window.  This makes "设为主通知窗口" take effect immediately
-        # for the session the user is managing from their previous/default
-        # window, instead of letting an old session_owner keep stealing routes.
-        effective_sid = self.effective_sid(event)
-        effective_flavor = self.effective_flavor(event) or "unknown"
         await self.set_user_state(event, primary_umo=target_umo)
-        if effective_sid:
-            await self.capture_window(effective_sid, target_umo, effective_flavor)
         logger.info(
-            "[dhapi] set_primary_window user=%s umo=%s captured_sid=%s flavor=%s",
+            "[dhapi] set_primary_window user=%s umo=%s",
             event.get_sender_id(),
             target_umo,
-            effective_sid[:8] if effective_sid else "",
-            effective_flavor,
         )
 
     # ──── 状态查询 ────
 
-    def current_sid(self, event: AstrMessageEvent) -> str | None:
-        """获取当前窗口的会话 ID"""
-        return self.binding_mgr.get_window_session(event.unified_msg_origin)
-
-    def current_flavor(self, event: AstrMessageEvent) -> str | None:
-        """获取当前窗口的 flavor"""
-        return self.binding_mgr.get_window_flavor(event.unified_msg_origin)
-
     def primary_umo(self, event: AstrMessageEvent) -> str | None:
-        """获取当前用户配置的默认通知窗口"""
+        """获取当前用户配置的默认通知窗口。"""
         state = self.get_user_state(event)
         primary_umo = state.get("primary_umo")
         return str(primary_umo) if primary_umo else None
@@ -167,32 +205,29 @@ class StateManager:
             return None
         return self.flavor_primary_umos(event).get(str(flavor).strip().lower())
 
-    def effective_sid(self, event: AstrMessageEvent) -> str | None:
-        """获取当前命令应作用的会话 ID；未显式绑定时回退到默认窗口的当前会话"""
-        current_sid = self.current_sid(event)
-        if current_sid:
-            return current_sid
+    def resolve_target_sid(
+        self, event: AstrMessageEvent, session_id: str | None
+    ) -> tuple[str | None, str]:
+        """解析工具操作目标 session。
 
-        primary_umo = self.primary_umo(event)
-        if not primary_umo or primary_umo == event.unified_msg_origin:
-            return None
-        return self.binding_mgr.get_window_session(primary_umo)
+        传入 session_id 时直接返回该 sid；未传时仅当当前窗口恰好 join 一个
+        session 才返回它，否则返回 no_session / ambiguous。
+        """
+        explicit_sid = str(session_id or "").strip()
+        if explicit_sid:
+            return explicit_sid, "ok"
 
-    def effective_flavor(self, event: AstrMessageEvent) -> str | None:
-        """获取当前命令应作用会话的 flavor；回退规则与 effective_sid 一致"""
-        current_flavor = self.current_flavor(event)
-        if current_flavor:
-            return current_flavor
-
-        primary_umo = self.primary_umo(event)
-        if not primary_umo or primary_umo == event.unified_msg_origin:
-            return None
-        return self.binding_mgr.get_window_flavor(primary_umo)
+        joined = self.binding_mgr.get_window_sessions(event.unified_msg_origin)
+        if len(joined) == 1:
+            return joined[0], "ok"
+        if not joined:
+            return None, "no_session"
+        return None, "ambiguous"
 
     def visible_sessions_for_window(
         self, event: AstrMessageEvent, sessions_cache: list[dict]
     ) -> list[dict]:
-        """返回当前窗口会接收通知的 session 列表"""
+        """返回当前窗口已订阅或可通过默认路由接收通知的 session 列表。"""
         current_umo = event.unified_msg_origin
         primary_umo = self.primary_umo(event)
         flavor_umos = self.flavor_primary_umos(event)
@@ -218,7 +253,7 @@ class StateManager:
                     visible_sessions.append(session)
                 continue
 
-            if not owners and primary_umo == current_umo:
+            if primary_umo == current_umo:
                 visible_sessions.append(session)
 
         return visible_sessions
@@ -252,13 +287,7 @@ class StateManager:
             self._flavor_primary_windows_cache = flavor_targets
 
     async def persist_notification_windows_index(self):
-        """Persist user-independent notification fallback windows.
-
-        The per-user state remains the source of truth, but this compact index is
-        intentionally redundant: external HAPI-created sessions have no owner, so
-        SSE notifications must still have a stable fallback after reloads or if an
-        old install has incomplete dhapi_known_users data.
-        """
+        """Persist user-independent notification fallback windows."""
         self._rebuild_notification_windows_index()
         await self.kv.put_kv_data("dhapi_primary_windows", self._primary_windows_cache)
         await self.kv.put_kv_data(
@@ -282,22 +311,12 @@ class StateManager:
         return targets
 
     def get_primary_windows(self) -> list[str]:
-        """返回所有用户当前生效的默认通知窗口（去重后）。
-
-        Includes a persisted global index and known window states as fallback so
-        REST-spawned sessions without owners still route to a stable Discord
-        notification window.
-        """
+        """返回所有用户当前生效的默认通知窗口（去重后）。"""
         targets: list[str] = []
         seen: set[str] = set()
         for state in self._user_states_cache.values():
             self._append_unique(targets, seen, state.get("primary_umo"))
         for umo in self._primary_windows_cache:
-            self._append_unique(targets, seen, umo)
-
-        # Last-resort stable fallback for upgraded installs where user state was
-        # not indexed yet: any window that has a persisted/loaded state or owner.
-        for umo in self.binding_mgr._window_states.keys():
             self._append_unique(targets, seen, umo)
         for umo in self.binding_mgr._window_sessions.keys():
             self._append_unique(targets, seen, umo)
@@ -306,55 +325,35 @@ class StateManager:
     def select_notification_targets(
         self, session_id: str, sessions_cache: list[dict]
     ) -> list[str]:
-        """根据 session 选择最终通知窗口；同一通知只投递到一个窗口。
-
-        路由优先级：
-        1. 显式主通知窗口若当前正选中该 session，则优先投递到主通知窗口。
-           这样用户把线程2设为主通知窗口并在那里操作当前 session 时，不会被旧 session_owner 抢回线程1。
-        2. session_owner，兼容每个 session 独立绑定窗口。
-        3. window_state / flavor 默认窗口 / 全局主窗口 fallback。
-        """
+        """根据 session 选择最终通知窗口；多订阅窗口群发，返回值已去重。"""
         reason = "none"
         targets: list[str] = []
+        seen: set[str] = set()
+
         if session_id:
-            primary_current_targets: list[str] = []
-            for primary_umo in self.get_primary_windows():
-                if self.binding_mgr.get_window_session(primary_umo) == session_id:
-                    primary_current_targets.append(primary_umo)
-            if primary_current_targets:
-                targets = [primary_current_targets[0]]
-                reason = "primary_current_session"
+            owners = self.binding_mgr.get_owners(session_id)
+            if owners:
+                for umo in owners:
+                    self._append_unique(targets, seen, umo)
+                reason = "session_owners"
             else:
-                owners = self.binding_mgr.get_owners(session_id)
-                if owners:
-                    targets = [owners[-1]]
-                    reason = "session_owner"
-                else:
-                    bound_umo = self.binding_mgr.find_window_by_session(session_id)
-                    if bound_umo:
-                        targets = [bound_umo]
-                        reason = "window_state"
-                    else:
-                        session = next(
-                            (s for s in sessions_cache if s.get("id") == session_id),
-                            None,
-                        )
-                        flavor = (
-                            session.get("metadata", {}).get("flavor")
-                            if session
-                            else None
-                        )
-                        flavor_targets = self.get_flavor_primary_windows(
-                            str(flavor).strip().lower() if flavor else None
-                        )
-                        if flavor_targets:
-                            targets = [flavor_targets[0]]
-                            reason = f"flavor_primary:{flavor}"
+                session = next(
+                    (s for s in sessions_cache if s.get("id") == session_id),
+                    None,
+                )
+                flavor = session.get("metadata", {}).get("flavor") if session else None
+                flavor_targets = self.get_flavor_primary_windows(
+                    str(flavor).strip().lower() if flavor else None
+                )
+                if flavor_targets:
+                    for umo in flavor_targets:
+                        self._append_unique(targets, seen, umo)
+                    reason = f"flavor_primary:{flavor}"
 
         if not targets:
-            primary_targets = self.get_primary_windows()
-            if primary_targets:
-                targets = [primary_targets[0]]
+            for umo in self.get_primary_windows():
+                self._append_unique(targets, seen, umo)
+            if targets:
                 reason = "primary"
 
         logger.info(
@@ -395,8 +394,7 @@ class StateManager:
     # ──── 数据加载 ────
 
     async def load_all(self):
-        """从 KV 加载所有状态"""
-        # 加载独立的默认通知窗口索引，保证外部 REST 创建的 session 有稳定 fallback。
+        """从 KV 加载所有状态。"""
         primary_windows = await self.kv.get_kv_data("dhapi_primary_windows", [])
         if isinstance(primary_windows, list):
             seen: set[str] = set()
@@ -420,102 +418,76 @@ class StateManager:
                 if targets:
                     self._flavor_primary_windows_cache[flavor_key] = targets
 
-        # 加载用户状态
         known_users = await self.kv.get_kv_data("dhapi_known_users", [])
         for uid in known_users:
             uid = str(uid)
             state = await self.kv.get_kv_data(f"dhapi_user_state_{uid}", None)
-            if state:
+            if isinstance(state, dict):
+                # 旧 current_* 字段只在 migrate_legacy_owner_state 中处理；运行态不再使用。
                 self._user_states_cache[uid] = state
 
-        # 加载会话绑定关系（兼容多会话绑定）
         stored_session_owners = await self.kv.get_kv_data("dhapi_session_owners", {})
         if isinstance(stored_session_owners, dict):
             for sid, umos in stored_session_owners.items():
-                if not isinstance(sid, str):
+                sid = str(sid or "").strip()
+                if not sid:
                     continue
-                # 兼容旧格式（列表）和新格式（字符串）
+                owner_list: list[str]
                 if isinstance(umos, list):
-                    if umos:
-                        umo = str(umos[-1])
-                        self._session_owners[sid] = umo
-                        if umo not in self.binding_mgr._window_sessions:
-                            self.binding_mgr._window_sessions[umo] = []
-                        if sid not in self.binding_mgr._window_sessions[umo]:
-                            self.binding_mgr._window_sessions[umo].append(sid)
+                    owner_list = [str(umo).strip() for umo in umos if str(umo).strip()]
                 elif isinstance(umos, str):
-                    self._session_owners[sid] = umos
-                    if umos not in self.binding_mgr._window_sessions:
-                        self.binding_mgr._window_sessions[umos] = []
-                    if sid not in self.binding_mgr._window_sessions[umos]:
-                        self.binding_mgr._window_sessions[umos].append(sid)
+                    owner_list = [umos.strip()] if umos.strip() else []
+                else:
+                    owner_list = []
+                for umo in owner_list:
+                    self.binding_mgr.join(sid, umo, self.binding_mgr.get_session_flavor(sid) or "unknown")
 
-        # 加载窗口状态。除了 session owner，也加载默认通知窗口，避免重载后
-        # primary_windows 有值但 window_state 缺失导致 fallback 不稳定。
-        state_umos: list[str] = []
-        seen_umos: set[str] = set()
-        for umo in self._session_owners.values():
-            self._append_unique(state_umos, seen_umos, umo)
-        for umo in self.get_primary_windows():
-            self._append_unique(state_umos, seen_umos, umo)
-        for umos in self._flavor_primary_windows_cache.values():
-            for umo in umos:
-                self._append_unique(state_umos, seen_umos, umo)
+        # 忽略并尽力清理已知旧窗口当前状态 KV。
+        legacy_umos: list[str] = []
+        known_chats = await self.kv.get_kv_data("dhapi_known_chats", [])
+        if isinstance(known_chats, list):
+            legacy_umos.extend(known_chats)
+        legacy_umos.extend(self.get_primary_windows())
+        for owners in self.binding_mgr._session_owners.values():
+            legacy_umos.extend(owners)
+        await self._delete_known_window_state_keys(legacy_umos)
 
-        for umo in state_umos:
-            window_state = await self.kv.get_kv_data(f"dhapi_window_state_{umo}", None)
-            if window_state:
-                self.binding_mgr.set_window_state(
-                    umo,
-                    window_state.get("current_session", ""),
-                    window_state.get("current_flavor", ""),
-                )
-
-        # User states are canonical; refresh and persist the compact index for future reloads.
         await self.persist_notification_windows_index()
 
-    async def migrate_to_capture_model(self):
-        """数据迁移：绑定模式 → 捕获+默认窗口模式"""
+    async def migrate_legacy_owner_state(self):
+        """数据迁移：旧 owner/current_session 状态 → join/leave 多对多订阅模型。"""
         migrated = False
+        legacy_umos: list[str] = []
 
-        # 迁移用户状态
         for uid, state in list(self._user_states_cache.items()):
             modified = False
 
-            # notify_umo → primary_umo
             if "notify_umo" in state and not state.get("primary_umo"):
                 state["primary_umo"] = state["notify_umo"]
                 modified = True
                 logger.info("迁移用户 %s: notify_umo → primary_umo", uid)
 
-            # 清理废弃字段
             if "notify_umo" in state:
                 del state["notify_umo"]
                 modified = True
 
-            # 迁移 current_session 到窗口状态
             old_session = state.get("current_session")
-            old_flavor = state.get("current_flavor")
+            old_flavor = state.get("current_flavor") or "unknown"
             if old_session:
                 target_umo = state.get("primary_umo")
-                for sid, umos in self._session_owners.items():
-                    if sid == old_session and umos:
-                        target_umo = umos[0]
-                        break
-
+                owners = self.binding_mgr.get_owners(str(old_session))
+                if owners:
+                    target_umo = owners[-1]
                 if target_umo:
-                    self.binding_mgr.bind_window(
-                        old_session, target_umo, old_flavor or "unknown"
-                    )
-                    await self.persist_session_owners()
-                    await self.persist_window_state(target_umo)
+                    legacy_umos.append(str(target_umo))
+                    self.binding_mgr.join(str(old_session), str(target_umo), str(old_flavor))
+                    migrated = True
                     logger.info(
-                        "迁移用户 %s: current_session → window_state[%s]",
+                        "迁移用户 %s: current_session → join[%s]",
                         uid,
-                        target_umo[:20],
+                        str(target_umo)[:20],
                     )
 
-            # 清理用户状态中的窗口级别字段
             if "current_session" in state:
                 del state["current_session"]
                 modified = True
@@ -528,13 +500,20 @@ class StateManager:
                 await self.kv.put_kv_data(f"dhapi_user_state_{uid}", state)
                 migrated = True
 
-        # 清理废弃的 chat_bindings KV 数据
         known_chats = await self.kv.get_kv_data("dhapi_known_chats", [])
         if known_chats:
             for umo in known_chats:
-                await self.kv.put_kv_data(f"dhapi_chat_binding_{umo}", None)
-            logger.info("已清理 %d 个废弃的 chat_binding 数据", len(known_chats))
+                await self._delete_kv_key(f"dhapi_chat_binding_{umo}")
+            legacy_umos.extend(str(umo) for umo in known_chats)
+            logger.info("已清理 %d 个废弃的 chat_binding/window_state 数据", len(known_chats))
             migrated = True
 
+        legacy_umos.extend(self.get_primary_windows())
+        for owners in self.binding_mgr._session_owners.values():
+            legacy_umos.extend(owners)
+        await self._delete_known_window_state_keys(legacy_umos)
+
         if migrated:
+            await self.persist_session_owners()
+            await self.persist_notification_windows_index()
             logger.info("数据迁移完成")
