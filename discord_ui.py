@@ -35,8 +35,11 @@ def _session_title(session: dict) -> str:
 def _session_desc(session: dict) -> str:
     meta = session.get("metadata") or {}
     path = meta.get("path", "") or "(无路径)"
+    state = session_ops.session_state(session)
     status = (
-        "思考中"
+        "已归档"
+        if state == "inactive"
+        else "思考中"
         if session.get("thinking")
         else "运行中"
         if session.get("active")
@@ -132,6 +135,35 @@ class DhapiBaseView(discord.ui.View):
         }
         visible_sids.add(self.umo)
         return self.plugin.pending_mgr.flatten_pending(self.event, visible_sids)
+
+    async def resume_session_to_current_window(
+        self, sid: str
+    ) -> tuple[bool, str, str | None]:
+        """Resume an inactive session and bind the resumed session to this window."""
+        cached = self.session_by_id(sid)
+        ok, msg, _latest = await session_ops.resume_precheck_latest(
+            self.plugin.client, sid, cached
+        )
+        if not ok:
+            return False, msg, None
+
+        ok, msg, resumed_sid = await session_ops.resume_session(self.plugin.client, sid)
+        if not ok or not resumed_sid:
+            return False, msg, None
+
+        await self.refresh_sessions()
+        resumed = self.session_by_id(resumed_sid)
+        flavor = (
+            ((resumed or {}).get("metadata") or {}).get("flavor")
+            or ((cached or {}).get("metadata") or {}).get("flavor")
+            or "claude"
+        )
+        if resumed_sid != sid:
+            await self.plugin.state_mgr.leave_all_session_owners(sid)
+        await self.plugin.state_mgr.join_session(resumed_sid, self.umo, flavor)
+        await self.plugin.state_mgr.set_user_state(self.event)
+        msg += f"\n已自动切换到恢复后的 session [{flavor}] {resumed_sid[:8]}..."
+        return True, msg, resumed_sid
 
 
 AGENT_OPTIONS = ("claude", "codex", "gemini", "opencode")
@@ -729,6 +761,20 @@ class DhapiMainView(DhapiBaseView):
         await self.edit(interaction, view.build_embed(), view)
 
     @discord.ui.button(
+        label="已归档",
+        style=discord.ButtonStyle.secondary,
+        emoji="🗃️",
+        custom_id="dhapi:main:archived",
+        row=1,
+    )
+    async def archived_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        await self.refresh_sessions()
+        view = ArchivedSessionsView(self.plugin, self.event)
+        await self.edit(interaction, view.build_embed(), view)
+
+    @discord.ui.button(
         label="关闭",
         style=discord.ButtonStyle.danger,
         emoji="✖️",
@@ -902,19 +948,172 @@ class SessionListView(DhapiBaseView):
         )
 
 
+ARCHIVED_PAGE_SIZE = 5
+
+
+class ArchivedResumeButton(discord.ui.Button):
+    def __init__(self, sid: str, number: int):
+        super().__init__(
+            label=f"Resume {number}",
+            style=discord.ButtonStyle.success,
+            emoji="▶️",
+            custom_id=f"dhapi:archived:resume:{sid[:32]}",
+            row=0,
+        )
+        self.sid = sid
+        self.number = number
+
+    async def callback(self, interaction: discord.Interaction):
+        view: ArchivedSessionsView = self.view  # type: ignore[assignment]
+        ok, msg, resumed_sid = await view.resume_session_to_current_window(self.sid)
+        if ok and resumed_sid:
+            action_view = SessionActionView(view.plugin, view.event, resumed_sid)
+            await view.edit(
+                interaction,
+                action_view.build_embed(("✅ " if ok else "❌ ") + msg),
+                action_view,
+            )
+            return
+
+        await view.refresh_sessions()
+        new_view = ArchivedSessionsView(view.plugin, view.event, view.page)
+        await view.edit(
+            interaction,
+            new_view.build_embed(("✅ " if ok else "❌ ") + msg),
+            new_view,
+        )
+
+
+class ArchivedSessionsView(DhapiBaseView):
+    def __init__(self, plugin, event, page: int = 0):
+        super().__init__(plugin, event)
+        self.archived_sessions = self._archived_sessions()
+        max_page = max(0, (len(self.archived_sessions) - 1) // ARCHIVED_PAGE_SIZE)
+        self.page = min(max(page, 0), max_page)
+        start = self.page * ARCHIVED_PAGE_SIZE
+        for number, session in enumerate(
+            self.archived_sessions[start : start + ARCHIVED_PAGE_SIZE], start + 1
+        ):
+            sid = session.get("id")
+            if sid:
+                self.add_item(ArchivedResumeButton(sid, number))
+        self._sync_buttons(max_page)
+
+    def _archived_sessions(self) -> list[dict]:
+        return [
+            s
+            for s in self.plugin.sessions_cache
+            if session_ops.session_state(s) == "inactive"
+        ]
+
+    def _sync_buttons(self, max_page: int):
+        for item in self.children:
+            custom_id = getattr(item, "custom_id", "")
+            if custom_id == "dhapi:archived:prev":
+                item.disabled = self.page <= 0
+            elif custom_id == "dhapi:archived:next":
+                item.disabled = self.page >= max_page
+
+    def build_embed(self, note: str = "") -> discord.Embed:
+        sessions = self.archived_sessions
+        max_page = max(0, (len(sessions) - 1) // ARCHIVED_PAGE_SIZE)
+        start = self.page * ARCHIVED_PAGE_SIZE
+        page_sessions = sessions[start : start + ARCHIVED_PAGE_SIZE]
+        lines = [
+            f"已归档 / inactive Session：`{len(sessions)}` 个",
+            f"页码：`{self.page + 1}/{max_page + 1}`（每页最多 {ARCHIVED_PAGE_SIZE} 个 Resume 按钮）",
+        ]
+        if not page_sessions:
+            lines.append("暂无可恢复 session。")
+        for number, session in enumerate(page_sessions, start + 1):
+            meta = session.get("metadata") or {}
+            path = meta.get("path", "") or "(无路径)"
+            lines.extend(
+                [
+                    "",
+                    f"**{number}.** `{session.get('id', '?')[:8]}` · {_session_title(session)}",
+                    f"路径：`{_clip(path, 200)}`",
+                    f"按钮：`Resume {number}`",
+                ]
+            )
+        if note:
+            lines.append(f"\n{note}")
+        return make_embed("已归档 Session", "\n".join(lines), BRAND)
+
+    @discord.ui.button(
+        label="上一页",
+        style=discord.ButtonStyle.secondary,
+        emoji="◀️",
+        custom_id="dhapi:archived:prev",
+        row=1,
+    )
+    async def prev_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        view = ArchivedSessionsView(self.plugin, self.event, self.page - 1)
+        await self.edit(interaction, view.build_embed(), view)
+
+    @discord.ui.button(
+        label="下一页",
+        style=discord.ButtonStyle.secondary,
+        emoji="▶️",
+        custom_id="dhapi:archived:next",
+        row=1,
+    )
+    async def next_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        view = ArchivedSessionsView(self.plugin, self.event, self.page + 1)
+        await self.edit(interaction, view.build_embed(), view)
+
+    @discord.ui.button(
+        label="刷新",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔄",
+        custom_id="dhapi:archived:refresh",
+        row=1,
+    )
+    async def refresh_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        await self.refresh_sessions()
+        view = ArchivedSessionsView(self.plugin, self.event, self.page)
+        await self.edit(interaction, view.build_embed("已刷新。"), view)
+
+    @discord.ui.button(
+        label="返回",
+        style=discord.ButtonStyle.secondary,
+        emoji="↩️",
+        custom_id="dhapi:archived:back",
+        row=1,
+    )
+    async def back_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        view = DhapiMainView(self.plugin, self.event)
+        await self.edit(
+            interaction, DhapiMainView.panel_embed(self.plugin, self.event), view
+        )
+
+
 class SessionActionView(DhapiBaseView):
     def __init__(self, plugin, event, sid: str):
         super().__init__(plugin, event)
         self.sid = sid
-        self._sync_join_button()
+        self._sync_buttons()
 
     def _is_joined(self) -> bool:
         return self.sid in self.plugin.binding_mgr.get_window_sessions(self.umo)
 
-    def _sync_join_button(self):
+    def _is_inactive(self) -> bool:
+        return session_ops.session_state(self.session_by_id(self.sid)) == "inactive"
+
+    def _sync_buttons(self):
         joined = self._is_joined()
+        inactive = self._is_inactive()
         for item in self.children:
-            if getattr(item, "custom_id", "") == "dhapi:session:join_leave":
+            custom_id = getattr(item, "custom_id", "")
+            if custom_id == "dhapi:session:join_leave":
                 item.label = "从此窗口退出" if joined else "在此窗口加入"
                 item.style = (
                     discord.ButtonStyle.secondary
@@ -922,6 +1121,14 @@ class SessionActionView(DhapiBaseView):
                     else discord.ButtonStyle.success
                 )
                 item.emoji = "➖" if joined else "✅"
+            elif custom_id in {
+                "dhapi:session:send",
+                "dhapi:session:stop",
+                "dhapi:session:archive",
+            }:
+                item.disabled = inactive
+            elif custom_id == "dhapi:session:resume":
+                item.disabled = not inactive
 
     def build_embed(self, note: str = "") -> discord.Embed:
         session = self.session_by_id(self.sid)
@@ -970,7 +1177,7 @@ class SessionActionView(DhapiBaseView):
                 self.umo,
                 self.event.session_id,
             )
-            self._sync_join_button()
+            self._sync_buttons()
             await self.edit(
                 interaction,
                 self.build_embed(f"已从当前窗口退出 `{self.sid[:8]}`。"),
@@ -989,7 +1196,7 @@ class SessionActionView(DhapiBaseView):
             flavor,
             self.event.session_id,
         )
-        self._sync_join_button()
+        self._sync_buttons()
         await self.edit(
             interaction,
             self.build_embed(
@@ -1033,7 +1240,27 @@ class SessionActionView(DhapiBaseView):
         self, button: discord.ui.Button, interaction: discord.Interaction
     ):
         await self.refresh_sessions()
-        await self.edit(interaction, self.build_embed("已刷新。"), self)
+        view = SessionActionView(self.plugin, self.event, self.sid)
+        await self.edit(interaction, view.build_embed("已刷新。"), view)
+
+    @discord.ui.button(
+        label="恢复",
+        style=discord.ButtonStyle.success,
+        emoji="▶️",
+        custom_id="dhapi:session:resume",
+        row=1,
+    )
+    async def resume_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        ok, msg, resumed_sid = await self.resume_session_to_current_window(self.sid)
+        target_sid = resumed_sid or self.sid
+        view = SessionActionView(self.plugin, self.event, target_sid)
+        await self.edit(
+            interaction,
+            view.build_embed(("✅ " if ok else "❌ ") + msg),
+            view,
+        )
 
     @discord.ui.button(
         label="停止",

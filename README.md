@@ -55,13 +55,13 @@ _✨ HAPI 远程 vibe coding 的 Discord 专用版 ✨_
 
 本插件是 [astrbot_plugin_hapi_connector](https://github.com/LiJinHao999/astrbot_plugin_hapi_connector)（作者 [@LiJinHao999](https://github.com/LiJinHao999)）的 **Discord 专用重构版**。
 
-上游插件覆盖 QQ / 微信 / Telegram 等多平台，使用 `/hapi xxx` 文本子命令完成会话管理、审批、文件操作。本插件**只面向 Discord**，把所有交互改造为 Discord 原生的 **Embed + Button + Select** 卡片，并将入口收敛为唯一的 slash command：
+上游插件覆盖 QQ / 微信 / Telegram 等多平台，使用 `/hapi xxx` 文本子命令完成会话管理、审批、文件操作。本插件**只面向 Discord**，把主要交互改造为 Discord 原生的 **Embed + Button + Select** 卡片，并将入口收敛为 slash command：
 
 ```
 /dhapi
 ```
 
-执行后会打开仅自己可见的 ephemeral 面板，全部操作通过按钮和下拉菜单完成。**所有 `/hapi xxx` 文本子命令在本插件中已废弃**。
+执行后会打开仅自己可见的 ephemeral 面板，绝大部分操作通过按钮和下拉菜单完成。**所有 `/hapi xxx` 文本子命令在本插件中已废弃**；仅保留 `/dhapi resume <序号|ID前缀>` 作为恢复已归档 inactive session 的文本入口。
 
 > 上游连接的后端服务依旧是 [HAPI](https://github.com/tiann/hapi)，本插件不修改后端协议，仅替换前端交互层。
 
@@ -72,7 +72,7 @@ _✨ HAPI 远程 vibe coding 的 Discord 专用版 ✨_
 | 维度 | 上游 hapi_connector | 本插件 hapi_discord_connector |
 |------|--------------------|------------------------------|
 | 目标平台 | QQ / 微信 / Telegram / Discord 等多平台 | **仅 Discord** |
-| 主要入口 | `/hapi list`、`/hapi sw`、`/hapi a` 等数十个文本子命令 | 唯一 slash command `/dhapi` |
+| 主要入口 | `/hapi list`、`/hapi sw`、`/hapi a` 等数十个文本子命令 | slash command `/dhapi`；恢复归档保留 `/dhapi resume` |
 | 交互形式 | 文本指令 + 文本回复 | Discord 原生 Embed / Button / Select / Modal |
 | 审批流程 | `/hapi a`、`/hapi deny`、戳一戳 | 卡片按钮原地点击，ephemeral 不污染频道 |
 | 创建 session | 多步文本向导 | Select 分步选 machine / agent / session_type / yolo / reasoning_effort，仅目录走 Modal |
@@ -85,7 +85,8 @@ _✨ HAPI 远程 vibe coding 的 Discord 专用版 ✨_
 
 `/dhapi` 打开后的主面板包含：
 
-- **Session 列表**：选择 session 后加入/退出当前窗口订阅、查看状态、停止生成、删除、归档、返回
+- **Session 列表**：选择 session 后加入/退出当前窗口订阅、查看状态、停止生成、删除、归档、返回；inactive session 可直接恢复
+- **已归档列表**：仅展示可恢复的 inactive session，并为每条提供 `Resume` 按钮
 - **当前状态**：当前绑定 session 的 flavor / 路径 / 模型 / 权限模式 / 思考状态
 - **审批面板**：选择 pending request 后批准、拒绝、批准全部、刷新、返回；审批通知优先使用 Embed + 原生 Discord 按钮，可直接批准/拒绝/打开审批面板，异常时保留 pending 并降级提示
 - **创建 session**：Select 分步选 machine / agent / session_type / yolo / reasoning_effort，仅目录走 Modal
@@ -120,6 +121,7 @@ _✨ HAPI 远程 vibe coding 的 Discord 专用版 ✨_
 | `dhapi_coding_create_session` | 创建新 session（需审批） |
 | `dhapi_coding_stop_message(session_id="")` | 停止消息生成（需审批） |
 | `dhapi_coding_archive_session(session_id="")` | 归档 session（危险，需审批） |
+| `dhapi_coding_resume_session(session_id="")` | 恢复已归档的 inactive session（需审批，含状态预检查） |
 | `dhapi_coding_delete_session(session_id="")` | 删除 session（危险，需审批） |
 | `dhapi_coding_change_config` | 修改插件配置 |
 
