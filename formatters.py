@@ -347,7 +347,6 @@ def format_session_list(
             current_path = path
 
         sid = s.get("id", "?")
-        sid_short = sid[:8]
         display_idx = index_by_sid.get(sid, local_idx)
         summary_data = meta.get("summary") or {}
         if isinstance(summary_data, dict):
@@ -369,8 +368,8 @@ def format_session_list(
         else:
             status = "⚪已关闭"
 
-        # 第一行：[序号|🏷️sid] 标题
-        lines.append(f"[{display_idx} | 🏷️{sid_short}] {summary}")
+        # 第一行：序号 + 完整 session_id（工具入参需要完整 UUID）+ 标题
+        lines.append(f"[{display_idx}] 🏷️{sid} {summary}")
 
         # 第二行：状态 | 模型 | 待审批 | 当前
         parts = [status, f"🤖{flavor}:{model}"]
