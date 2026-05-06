@@ -1,5 +1,10 @@
 # 更新日志
 
+## v1.3.3 — agent final 模板回归
+
+1. 修复 `_prepare_final_message` 没有应用 `trigger_message_template` 配置的问题，注入主链的 synthetic user 消息现在会重新走用户配置的模板。
+2. 长文本兜底分支也接入模板：模板里的 `{content}` 占位会被替换成"预览 + 文件路径 + 提示"组合段。
+
 ## v1.3.2 — DHAPI agent final 注入修复
 
 1. 修复 agent final cached 路径偶发吞正文导致对话历史只剩 `<system_reminder>` 时间戳壳的问题；synthetic event 统一走 fallback 从 0 构造 `DiscordPlatformEvent`，不再复用 base_event 的 `_extras` / `message_obj`。

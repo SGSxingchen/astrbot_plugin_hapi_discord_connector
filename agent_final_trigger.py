@@ -163,9 +163,14 @@ class AgentFinalTrigger:
             "dhapi_final_chars": len(payload.content),
             "dhapi_final_truncated": injected_truncated,
         }
+        template = self._cfg_template()
         if len(content) < use_file_at:
             meta["dhapi_final_preview_chars"] = len(content)
-            return content, meta
+            try:
+                text = template.format(content=content)
+            except Exception:
+                text = content
+            return text, meta
 
         preview = self._preview(content)
         file_path = self._write_agent_final_file(payload, payload.content)
@@ -175,12 +180,15 @@ class AgentFinalTrigger:
                 "dhapi_final_preview_chars": len(preview),
             }
         )
-        text = (
-            "【DHAPI_AGENT_FINAL】Codex 会话已完成。这是 HAPI/Codex 的回包，不是用户新任务，请不要再发回 Codex。\n"
+        body = (
             f"预览：{preview}\n"
             f"完整内容已写入文件：{file_path}\n"
             "如需查看全文，请用文件读取工具读取该路径。"
         )
+        try:
+            text = template.format(content=body)
+        except Exception:
+            text = body
         return text, meta
 
     def _mark_dedupe(self, event_id: str) -> bool:
