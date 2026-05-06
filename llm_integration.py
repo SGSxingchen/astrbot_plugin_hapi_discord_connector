@@ -64,7 +64,8 @@ class LLMIntegration:
             "dhapi_coding_list_commands",
             "dhapi_coding_execute_command",
             "dhapi_coding_send_message",
-            "dhapi_coding_switch_session",
+            "dhapi_coding_join_session",
+            "dhapi_coding_leave_session",
             "dhapi_coding_create_session",
             "dhapi_coding_get_config_status",
             "dhapi_coding_change_config",
@@ -80,7 +81,8 @@ class LLMIntegration:
             "dhapi_coding_get_config_status",
             "dhapi_coding_list_commands",
             "dhapi_coding_send_message",
-            "dhapi_coding_switch_session",
+            "dhapi_coding_join_session",
+            "dhapi_coding_leave_session",
             "dhapi_coding_create_session",
             "dhapi_coding_change_config",
             "dhapi_coding_stop_message",
@@ -220,15 +222,42 @@ class LLMIntegration:
             logger.warning(f"LLM 工具 {tool_name} 审批被取消")
             return False, "cancelled"
 
-    def _effective_sid(self, event: AstrMessageEvent) -> str | None:
-        """统一解析当前工具应作用的 session。"""
-        return self.state_mgr.effective_sid(event)
+    def _joined_session_lines(self, event: AstrMessageEvent) -> list[str]:
+        """格式化当前窗口已加入 session 的短列表。"""
+        joined = self.state_mgr.binding_mgr.get_window_sessions(event.unified_msg_origin)
+        lines: list[str] = []
+        for idx, sid in enumerate(joined, 1):
+            session = next((s for s in self.sessions_cache if s.get("id") == sid), None)
+            title = "(未知 session)"
+            if session:
+                meta = session.get("metadata") or {}
+                summary = (meta.get("summary") or {}).get("text", "") or "(无标题)"
+                flavor = meta.get("flavor", "?")
+                title = f"[{flavor}] {summary}"
+            lines.append(f"{idx}. {sid[:8]} - {title}")
+        return lines
+
+    def _resolve_sid_text(
+        self, event: AstrMessageEvent, session_id: str | None
+    ) -> tuple[str | None, str | None]:
+        """解析工具目标 session；失败时返回 LLM 可读提示。"""
+        sid, reason = self.state_mgr.resolve_target_sid(event, session_id)
+        if sid:
+            return sid, None
+        if reason == "ambiguous":
+            lines = self._joined_session_lines(event)
+            return (
+                None,
+                "当前窗口已加入多个 session，请在下一轮工具调用里显式传 session_id：\n"
+                + "\n".join(lines[:10]),
+            )
+        return None, self._missing_session_text()
 
     @staticmethod
     def _missing_session_text() -> str:
         return (
-            "当前没有可操作的 session。请先调用 dhapi_coding_list_sessions 查看会话，"
-            "再用 dhapi_coding_switch_session 切换，或先创建一个新 session。"
+            "当前窗口未加入任何 session，请先用 dhapi_coding_join_session(session_id) 加入，"
+            "或在参数里直接传 session_id。"
         )
 
     @staticmethod
@@ -245,12 +274,11 @@ class LLMIntegration:
 
     # ──── 查询类工具（无需审批）────
 
-    async def tool_get_status(self, event: AstrMessageEvent):
-        """获取当前交互中的 HAPI session 的状态信息。"""
-        sid = self._effective_sid(event)
-        if not sid:
-            return self._missing_session_text()
-            return
+    async def tool_get_status(self, event: AstrMessageEvent, session_id: str = ""):
+        """获取 HAPI session 的状态信息。"""
+        sid, error = self._resolve_sid_text(event, session_id)
+        if error:
+            return error
 
         try:
             detail = await session_ops.fetch_session_detail(self.client, sid)
@@ -301,8 +329,9 @@ class LLMIntegration:
             return "没有找到符合条件的 session"
             return
 
-        # 复用 formatters.format_session_list，但移除 emoji
-        current_sid = self._effective_sid(event)
+        # 复用 formatters.format_session_list，但移除 emoji；只有窗口恰好加入一个
+        # session 时才显示为当前糖。
+        current_sid, _ = self.state_mgr.resolve_target_sid(event, "")
         text = formatters.format_session_list(
             sessions,
             current_sid,
@@ -326,16 +355,18 @@ class LLMIntegration:
 
         return text
 
-    async def tool_message_history(self, event: AstrMessageEvent, rounds: int = 1):
-        """查询当前交互中的 session 的历史消息。
+    async def tool_message_history(
+        self, event: AstrMessageEvent, rounds: int = 1, session_id: str = ""
+    ):
+        """查询 HAPI session 的历史消息。
 
         Args:
             rounds(number): 查询最近几轮消息（默认 1 轮）
+            session_id(string): 可选，显式 session ID；不传时当前窗口必须只加入一个 session
         """
-        sid = self._effective_sid(event)
-        if not sid:
-            return self._missing_session_text()
-            return
+        sid, error = self._resolve_sid_text(event, session_id)
+        if error:
+            return error
 
         try:
             # 多取消息以保证覆盖 N 轮
@@ -406,26 +437,30 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         return (
             "Discord 侧仅保留 /dhapi 一个入口，会打开按钮/下拉菜单/Modal 控制面板；"
             "不再支持 /dhapi list/sw/a/deny 等文本子命令。\n"
-            "LLM 可直接使用 dhapi_coding_list_sessions、dhapi_coding_switch_session、"
+            "LLM 可直接使用 dhapi_coding_list_sessions、dhapi_coding_join_session、"
             "dhapi_coding_send_message、dhapi_coding_stop_message 等工具完成操作。"
         )
 
     # ──── 操作类工具（需要审批）────
 
-    async def tool_send_message(self, event: AstrMessageEvent, message: str):
-        """向当前 session 发送消息。
+    async def tool_send_message(
+        self, event: AstrMessageEvent, message: str, session_id: str = ""
+    ):
+        """向 HAPI session 发送消息。
 
         Args:
             message(string): 要发送的消息内容
+            session_id(string): 可选，显式 session ID；不传时当前窗口必须只加入一个 session
         """
-        sid = self._effective_sid(event)
-        if not sid:
-            return self._missing_session_text()
-            return
+        sid, error = self._resolve_sid_text(event, session_id)
+        if error:
+            return error
 
         # 请求审批
         approved, reason = await self._require_approval(
-            "dhapi_coding_send_message", {"message": message}, event
+            "dhapi_coding_send_message",
+            {"message": message, "session_id": sid[:8]},
+            event,
         )
         logger.debug(f"[tool_send_message] approved={approved}, reason={reason}")
         if not approved:
@@ -441,15 +476,32 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         ok, result = await session_ops.send_message(self.client, sid, message)
         return result if ok else f"发送失败: {result}"
 
-    async def tool_switch_session(self, event: AstrMessageEvent, target: str):
-        """切换到指定的 session。
+    def _find_session_by_id_or_prefix(self, target: str) -> tuple[dict | None, str | None]:
+        """按完整 ID / 前缀 / 列表序号解析 session。"""
+        sessions = self.sessions_cache
+        value = (target or "").strip()
+        if not value:
+            return None, "请提供 session_id。"
+        if value.isdigit():
+            idx = int(value)
+            if 1 <= idx <= len(sessions):
+                return sessions[idx - 1], None
+        matches = [s for s in sessions if s.get("id", "").startswith(value)]
+        if len(matches) == 1:
+            return matches[0], None
+        if len(matches) > 1:
+            return None, f"匹配到 {len(matches)} 个 session，请提供更长的 ID 前缀。"
+        return None, f"未找到匹配的 session: {value}"
+
+    async def tool_join_session(self, event: AstrMessageEvent, session_id: str):
+        """把指定 session 加入当前 Discord 窗口订阅。
 
         Args:
-            target(string): session 序号（如 "1"）或 session ID（如 "abc12345"）
+            session_id(string): session ID / ID 前缀 / session 列表序号
         """
         # 请求审批
         approved, reason = await self._require_approval(
-            "dhapi_coding_switch_session", {"target": target}, event
+            "dhapi_coding_join_session", {"session_id": session_id}, event
         )
         if not approved:
             if reason == "timeout":
@@ -461,33 +513,42 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             return
 
         await self.plugin._refresh_sessions()
-        sessions = self.sessions_cache
-        chosen = None
-        target = (target or "").strip()
-        if target.isdigit():
-            idx = int(target)
-            if 1 <= idx <= len(sessions):
-                chosen = sessions[idx - 1]
-        if chosen is None:
-            matches = [s for s in sessions if s.get("id", "").startswith(target)]
-            if len(matches) == 1:
-                chosen = matches[0]
-            elif len(matches) > 1:
-                return f"匹配到 {len(matches)} 个 session，请提供更长的 ID 前缀。"
-        if chosen is None:
-            return f"未找到匹配的 session: {target}"
+        chosen, error = self._find_session_by_id_or_prefix(session_id)
+        if error:
+            return error
 
         sid = chosen["id"]
         flavor = (chosen.get("metadata") or {}).get("flavor", "claude")
-        await self.state_mgr.capture_window(sid, event.unified_msg_origin, flavor)
+        await self.state_mgr.join_session(sid, event.unified_msg_origin, flavor)
         await self.state_mgr.set_user_state(event)
         logger.info(
-            "[dhapi] LLM switch bound sid=%s umo=%s flavor=%s",
+            "[dhapi] LLM join sid=%s umo=%s flavor=%s",
             sid[:8],
             event.unified_msg_origin,
             flavor,
         )
-        return f"已切换当前 Discord 对话的 HAPI session 到 [{flavor}] {sid[:8]}"
+        return f"已在当前 Discord 窗口加入 [{flavor}] {sid[:8]}"
+
+    async def tool_leave_session(self, event: AstrMessageEvent, session_id: str = ""):
+        """当前 Discord 窗口退出指定 session 订阅。"""
+        sid, error = self._resolve_sid_text(event, session_id)
+        if error:
+            return error
+
+        approved, reason = await self._require_approval(
+            "dhapi_coding_leave_session", {"session_id": sid[:8]}, event
+        )
+        if not approved:
+            if reason == "timeout":
+                return "操作超时：60秒内未收到用户审批。请提醒用户打开 /dhapi 审批面板处理。"
+            elif reason == "notification_failed":
+                return "操作失败：无法发送审批通知到用户。请检查是否已加入 session。"
+            else:
+                return "操作已被用户拒绝，请停止工具调用，先交流清楚问题"
+
+        await self.state_mgr.leave_session(sid, event.unified_msg_origin)
+        await self.state_mgr.set_user_state(event)
+        return f"已从当前 Discord 窗口退出 session `{sid[:8]}`"
 
     async def tool_create_session(
         self,
@@ -590,10 +651,10 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             model_reasoning_effort=normalized_effort or None,
         )
         if ok and sid:
-            await self.state_mgr.capture_window(sid, event.unified_msg_origin, agent)
+            await self.state_mgr.join_session(sid, event.unified_msg_origin, agent)
             await self.state_mgr.set_user_state(event)
             logger.info(
-                "[dhapi] LLM create bound sid=%s umo=%s flavor=%s",
+                "[dhapi] LLM create joined sid=%s umo=%s flavor=%s",
                 sid[:8],
                 event.unified_msg_origin,
                 agent,
@@ -655,12 +716,11 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         else:
             return f"不支持的配置项: {config_name}，请先调用 dhapi_coding_get_config_status 查看可用配置"
 
-    async def tool_stop_message(self, event: AstrMessageEvent):
-        """停止当前 session 的消息生成。"""
-        sid = self._effective_sid(event)
-        if not sid:
-            return self._missing_session_text()
-            return
+    async def tool_stop_message(self, event: AstrMessageEvent, session_id: str = ""):
+        """停止 HAPI session 的消息生成。"""
+        sid, error = self._resolve_sid_text(event, session_id)
+        if error:
+            return error
 
         # 请求审批
         approved, reason = await self._require_approval(
@@ -681,11 +741,11 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             await self.plugin._refresh_sessions()
         return msg
 
-    async def tool_archive_session(self, event: AstrMessageEvent):
-        """归档当前 session。"""
-        sid = self._effective_sid(event)
-        if not sid:
-            return self._missing_session_text()
+    async def tool_archive_session(self, event: AstrMessageEvent, session_id: str = ""):
+        """归档 HAPI session。"""
+        sid, error = self._resolve_sid_text(event, session_id)
+        if error:
+            return error
 
         approved, reason = await self._require_approval(
             "dhapi_coding_archive_session", {"session_id": sid[:8]}, event
@@ -703,11 +763,11 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             await self.plugin._refresh_sessions()
         return msg
 
-    async def tool_delete_session(self, event: AstrMessageEvent):
-        """删除当前 session。危险操作，必须审批。"""
-        sid = self._effective_sid(event)
-        if not sid:
-            return self._missing_session_text()
+    async def tool_delete_session(self, event: AstrMessageEvent, session_id: str = ""):
+        """删除 HAPI session。危险操作，必须审批。"""
+        sid, error = self._resolve_sid_text(event, session_id)
+        if error:
+            return error
 
         approved, reason = await self._require_approval(
             "dhapi_coding_delete_session", {"session_id": sid[:8]}, event
@@ -722,7 +782,7 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
 
         ok, msg = await session_ops.delete_session(self.client, sid)
         if ok:
-            await self.plugin.state_mgr.unbind_window(event.unified_msg_origin)
+            await self.plugin.state_mgr.leave_all_session_owners(sid)
             await self.plugin._refresh_sessions()
         return msg
 
@@ -730,7 +790,7 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         """文本 /dhapi 子命令已废弃；请改用专用 dhapi_coding_* 工具。"""
         return (
             "文本 /dhapi 子命令已废弃。Discord 用户请使用 /dhapi 打开交互面板；"
-            "LLM 请直接调用 dhapi_coding_list_sessions / dhapi_coding_switch_session / "
+            "LLM 请直接调用 dhapi_coding_list_sessions / dhapi_coding_join_session / "
             "dhapi_coding_send_message / dhapi_coding_stop_message / "
             "dhapi_coding_archive_session / dhapi_coding_delete_session 等专用工具。"
         )
