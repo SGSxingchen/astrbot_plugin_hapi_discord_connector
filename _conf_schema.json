@@ -116,6 +116,24 @@
     "default": 12000,
     "hint": "超过会截断，避免超长 final 塞爆上下文"
   },
+  "agent_final_preview_chars": {
+    "description": "agent final 写文件时的预览字符数",
+    "type": "int",
+    "default": 240,
+    "hint": "仅把短预览注入主链，避免记忆检索长查询"
+  },
+  "agent_final_file_ttl_days": {
+    "description": "agent final 临时文件保留天数",
+    "type": "int",
+    "default": 7,
+    "hint": "触发时自动清理超过该天数的旧文件"
+  },
+  "agent_final_use_file_when_chars": {
+    "description": "agent final 超过多少字符时写入临时文件",
+    "type": "int",
+    "default": 800,
+    "hint": "低于该长度直接注入完整文本"
+  },
   "dedupe_ttl_seconds": {
     "description": "agent final event_id 去重 TTL（秒）",
     "type": "int",
