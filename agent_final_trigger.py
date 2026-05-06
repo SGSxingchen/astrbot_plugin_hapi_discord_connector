@@ -9,8 +9,10 @@ assistant final message.
 from __future__ import annotations
 
 import copy
+import re
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
@@ -101,6 +103,100 @@ class AgentFinalTrigger:
             )
         except Exception:
             return "【DHAPI_AGENT_FINAL】Codex 会话已完成。这是来自 HAPI/Codex 的 assistant final 回包，不是用户新任务，请不要把它再次发送给 Codex。\n完成信息：\n{content}"
+
+    @staticmethod
+    def _safe_filename_part(value: str, default: str = "final") -> str:
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip())
+        safe = safe.strip(".-")
+        return safe[:80] or default
+
+    def _agent_final_dir(self) -> Path:
+        """Return AstrBot/data/temp/dhapi_agent_final, with plugin-local fallback."""
+        plugin_dir = Path(__file__).resolve().parent
+        try:
+            # Normal plugin layout:
+            #   <AstrBot root>/data/plugins/astrbot_plugin_hapi_discord_connector
+            data_dir = plugin_dir.parent.parent
+            if data_dir.name == "data":
+                return data_dir / "temp" / "dhapi_agent_final"
+        except Exception:
+            pass
+        return plugin_dir / "data" / "temp" / "agent_final"
+
+    def _cleanup_agent_final_files(self) -> None:
+        ttl_days = max(0, self._cfg_int("agent_final_file_ttl_days", 7))
+        if ttl_days <= 0:
+            return
+        try:
+            final_dir = self._agent_final_dir()
+            if not final_dir.exists():
+                return
+            cutoff = time.time() - ttl_days * 86400
+            for path in final_dir.iterdir():
+                try:
+                    if path.is_file() and path.stat().st_mtime < cutoff:
+                        path.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _preview(self, content: str) -> str:
+        preview_chars = max(1, self._cfg_int("agent_final_preview_chars", 240))
+        if len(content) <= preview_chars:
+            return content
+        head = content[:preview_chars]
+        # Prefer not to cut mid-line when there is a useful newline near the end.
+        newline_at = head.rfind("\n")
+        if newline_at >= max(40, preview_chars // 2):
+            head = head[:newline_at].rstrip()
+        return head.rstrip() + "\n…"
+
+    def _write_agent_final_file(self, payload: AgentFinalPayload, content: str) -> str:
+        self._cleanup_agent_final_files()
+        final_dir = self._agent_final_dir()
+        final_dir.mkdir(parents=True, exist_ok=True)
+        sid = self._safe_filename_part(payload.session_id[:8], "session")
+        eid = self._safe_filename_part(payload.event_id, str(time.time_ns()))
+        path = final_dir / f"{sid}-{eid}.md"
+        if path.exists():
+            path = final_dir / f"{sid}-{eid}-{time.time_ns()}.md"
+        path.write_text(content, encoding="utf-8")
+        return str(path.resolve())
+
+    def _prepare_final_message(
+        self, payload: AgentFinalPayload
+    ) -> tuple[str, dict[str, Any]]:
+        """Prepare synthetic message text and metadata for the final payload.
+
+        Long finals are written to a local file so AstrBot memory/vector hooks do
+        not receive the whole assistant final as a retrieval query.
+        """
+        content = self._truncate(payload.content)
+        self._cleanup_agent_final_files()
+        use_file_at = max(1, self._cfg_int("agent_final_use_file_when_chars", 800))
+        meta: dict[str, Any] = {
+            "dhapi_final_chars": len(payload.content),
+        }
+        if len(content) < use_file_at:
+            meta["dhapi_final_preview_chars"] = len(content)
+            return content, meta
+
+        preview = self._preview(content)
+        file_path = self._write_agent_final_file(payload, content)
+        meta.update(
+            {
+                "dhapi_final_file": file_path,
+                "dhapi_final_preview_chars": len(preview),
+            }
+        )
+        text = (
+            "【DHAPI_AGENT_FINAL】Codex 会话已完成。这是 HAPI/Codex 的回包，不是用户新任务，请不要再发回 Codex。\n"
+            f"预览：{preview}\n"
+            f"完整内容已写入文件：{file_path}\n"
+            "如需查看全文，请用文件读取工具读取该路径。"
+        )
+        return text, meta
 
     def _mark_dedupe(self, event_id: str) -> bool:
         ttl = max(1, self._cfg_int("dedupe_ttl_seconds", 3600))
@@ -196,8 +292,10 @@ class AgentFinalTrigger:
     def _is_group_session(session: MessageSession) -> bool:
         return session.message_type.value == "GroupMessage"
 
-    def _raw_message(self, payload: AgentFinalPayload, target_umo: str) -> dict[str, Any]:
-        return {
+    def _raw_message(
+        self, payload: AgentFinalPayload, target_umo: str, final_meta: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        raw = {
             "synthetic": True,
             "source": self.SOURCE,
             "session_id": payload.session_id,
@@ -205,8 +303,13 @@ class AgentFinalTrigger:
             "event_id": payload.event_id,
             "target_umo": target_umo,
         }
+        if final_meta:
+            raw.update(final_meta)
+        return raw
 
-    def _refresh_event_flags(self, event, payload: AgentFinalPayload) -> None:
+    def _refresh_event_flags(
+        self, event, payload: AgentFinalPayload, final_meta: dict[str, Any] | None = None
+    ) -> None:
         event.clear_result()
         event._force_stopped = False
         event._has_send_oper = False
@@ -221,6 +324,9 @@ class AgentFinalTrigger:
         event.set_extra("session_id", payload.session_id)
         event.set_extra("agent", payload.agent)
         event.set_extra("event_id", payload.event_id)
+        if final_meta:
+            for key, value in final_meta.items():
+                event.set_extra(key, value)
 
     def _build_message_obj(
         self,
@@ -230,6 +336,7 @@ class AgentFinalTrigger:
         text: str,
         payload: AgentFinalPayload,
         target_umo: str,
+        final_meta: dict[str, Any] | None = None,
         base_message_obj=None,
     ) -> AstrBotMessage:
         msg = copy.copy(base_message_obj) if base_message_obj is not None else AstrBotMessage()
@@ -240,7 +347,7 @@ class AgentFinalTrigger:
         msg.message_id = f"dhapi-agent-final:{payload.event_id}"
         msg.message = [Plain(text)]
         msg.message_str = text
-        msg.raw_message = self._raw_message(payload, target_umo)
+        msg.raw_message = self._raw_message(payload, target_umo, final_meta)
         msg.timestamp = int(time.time())
 
         sender_id = self._fallback_sender_id(target_umo)
@@ -255,7 +362,12 @@ class AgentFinalTrigger:
         return msg
 
     def _build_from_cached_event(
-        self, base_event, target_umo: str, text: str, payload: AgentFinalPayload
+        self,
+        base_event,
+        target_umo: str,
+        text: str,
+        payload: AgentFinalPayload,
+        final_meta: dict[str, Any] | None = None,
     ):
         # Normal cached-event path, with key Discord context refreshed from the
         # explicitly-typed live DiscordPlatformAdapter.
@@ -273,13 +385,20 @@ class AgentFinalTrigger:
             text=text,
             payload=payload,
             target_umo=target_umo,
+            final_meta=final_meta,
             base_message_obj=base_event.message_obj,
         )
-        self._refresh_event_flags(event, payload)
+        self._refresh_event_flags(event, payload, final_meta)
         self._validate_event_send_context(event, target_umo)
         return event
 
-    def _build_fallback_event(self, umo: str, text: str, payload: AgentFinalPayload):
+    def _build_fallback_event(
+        self,
+        umo: str,
+        text: str,
+        payload: AgentFinalPayload,
+        final_meta: dict[str, Any] | None = None,
+    ):
         # No cached base_event: construct a qualified DiscordPlatformEvent from
         # the HAPI session binding target.  This still enters AstrBot through the
         # normal event queue and respond stage.
@@ -290,6 +409,7 @@ class AgentFinalTrigger:
             text=text,
             payload=payload,
             target_umo=umo,
+            final_meta=final_meta,
         )
 
         event = DiscordPlatformEvent(
@@ -300,12 +420,16 @@ class AgentFinalTrigger:
             client=client,
             interaction_followup_webhook=None,
         )
-        self._refresh_event_flags(event, payload)
+        self._refresh_event_flags(event, payload, final_meta)
         self._validate_event_send_context(event, umo)
         return event
 
     def _recover_event_context(
-        self, text: str, payload: AgentFinalPayload, reason: Exception
+        self,
+        text: str,
+        payload: AgentFinalPayload,
+        reason: Exception,
+        final_meta: dict[str, Any] | None = None,
     ):
         """One-shot recovery for missing cached event Discord context.
 
@@ -324,7 +448,7 @@ class AgentFinalTrigger:
             target_umo,
             reason,
         )
-        event = self._build_fallback_event(target_umo, text, payload)
+        event = self._build_fallback_event(target_umo, text, payload, final_meta)
         self._validate_event_send_context(event, target_umo)
         return event
 
@@ -352,14 +476,24 @@ class AgentFinalTrigger:
             )
             return
 
-        content = self._truncate(payload.content)
-        text = self._cfg_template().format(content=content)
+        try:
+            text, final_meta = self._prepare_final_message(payload)
+        except Exception as exc:
+            logger.warning(
+                "[dhapi] agent final trigger skipped: prepare message failed sid=%s event_id=%s: %s",
+                payload.session_id[:8],
+                payload.event_id,
+                exc,
+            )
+            return
         base_event = self._event_cache.get(umo)
         try:
             if base_event is not None:
-                event = self._build_from_cached_event(base_event, umo, text, payload)
+                event = self._build_from_cached_event(
+                    base_event, umo, text, payload, final_meta
+                )
             else:
-                event = self._build_fallback_event(umo, text, payload)
+                event = self._build_fallback_event(umo, text, payload, final_meta)
         except Exception as exc:
             if not self._is_recoverable_context_error(exc):
                 logger.warning(
@@ -371,7 +505,7 @@ class AgentFinalTrigger:
                 )
                 return
             try:
-                event = self._recover_event_context(text, payload, exc)
+                event = self._recover_event_context(text, payload, exc, final_meta)
             except Exception as recover_exc:
                 logger.warning(
                     "[dhapi] agent final trigger recovery failed sid=%s event_id=%s umo=%s: %s",

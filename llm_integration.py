@@ -370,6 +370,11 @@ class LLMIntegration:
         )
         trigger_agents = self.plugin.config.get("trigger_agents", ["codex"])
         max_content_chars = self.plugin.config.get("max_content_chars", 12000)
+        final_preview_chars = self.plugin.config.get("agent_final_preview_chars", 240)
+        final_file_ttl_days = self.plugin.config.get("agent_final_file_ttl_days", 7)
+        final_use_file_when_chars = self.plugin.config.get(
+            "agent_final_use_file_when_chars", 800
+        )
         info = f"""当前配置状态:
 
 output_level (SSE推送级别): {output_level}
@@ -390,6 +395,9 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
   仅响应 HAPI 原始 SSE 完成事件中的 assistant final；默认只支持 codex
   trigger_agents: {trigger_agents}
   max_content_chars: {max_content_chars}
+  agent_final_preview_chars: {final_preview_chars}
+  agent_final_file_ttl_days: {final_file_ttl_days}
+  agent_final_use_file_when_chars: {final_use_file_when_chars}
   值: true/false"""
         return info
 
