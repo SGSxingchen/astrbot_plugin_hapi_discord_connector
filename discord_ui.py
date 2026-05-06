@@ -105,7 +105,11 @@ class DhapiBaseView(discord.ui.View):
         await asyncio.wait_for(self.plugin._refresh_sessions(), timeout=15)
 
     def current_sid(self) -> str | None:
-        return self.plugin.binding_mgr.get_window_session(self.umo)
+        sessions = self.plugin.binding_mgr.get_window_sessions(self.umo)
+        return sessions[0] if len(sessions) == 1 else None
+
+    def joined_sids(self) -> list[str]:
+        return self.plugin.binding_mgr.get_window_sessions(self.umo)
 
     def session_by_id(self, sid: str | None) -> dict | None:
         if not sid:
@@ -531,10 +535,10 @@ class ConfirmCreateView(DhapiBaseView):
         await self.refresh_sessions()
         session = self.session_by_id(sid)
         flavor = ((session or {}).get("metadata") or {}).get("flavor") or self.agent
-        await self.plugin.state_mgr.capture_window(sid, self.umo, flavor)
+        await self.plugin.state_mgr.join_session(sid, self.umo, flavor)
         await self.plugin.state_mgr.set_user_state(self.event)
         logger.info(
-            "[dhapi] UI create bound sid=%s umo=%s flavor=%s event_session=%s",
+            "[dhapi] UI create joined sid=%s umo=%s flavor=%s event_session=%s",
             sid[:8],
             self.umo,
             flavor,
@@ -619,15 +623,16 @@ class SendMessageModal(discord.ui.Modal):
 class DhapiMainView(DhapiBaseView):
     @staticmethod
     def panel_embed(plugin, event) -> discord.Embed:
-        current_sid = plugin.binding_mgr.get_window_session(event.unified_msg_origin)
-        current = "未选择"
-        if current_sid:
-            session = next(
-                (s for s in plugin.sessions_cache if s.get("id") == current_sid), None
-            )
-            current = _session_title(session) if session else current_sid[:8]
+        joined = plugin.binding_mgr.get_window_sessions(event.unified_msg_origin)
+        if len(joined) == 1:
+            session = next((s for s in plugin.sessions_cache if s.get("id") == joined[0]), None)
+            joined_text = _session_title(session) if session else joined[0][:8]
+        elif joined:
+            joined_text = f"{len(joined)} 个（操作时需显式选择/传 session_id）"
+        else:
+            joined_text = "未加入"
         pending_count = len(plugin.pending_mgr.flatten_pending(None, None))
-        desc = f"当前 Session：`{current}`\n待审批：`{pending_count}`\n\n使用下方按钮操作 HAPI。"
+        desc = f"本窗口已加入 Session：`{joined_text}`\n待审批：`{pending_count}`\n\n使用下方按钮操作 HAPI。"
         return make_embed("HAPI Discord 控制台", desc, BRAND)
 
     @discord.ui.button(
@@ -681,18 +686,20 @@ class DhapiMainView(DhapiBaseView):
     async def status_button(
         self, button: discord.ui.Button, interaction: discord.Interaction
     ):
-        sid = self.current_sid()
-        if not sid:
+        joined = self.joined_sids()
+        if len(joined) != 1:
             await self.edit(
                 interaction,
                 make_embed(
-                    "当前状态", "尚未选择 session。请先进入「列表」选择。", WARN
+                    "当前状态",
+                    "本窗口未加入 session 或已加入多个 session。请进入「列表」打开具体 session。",
+                    WARN,
                 ),
                 self,
             )
             return
         await self.refresh_sessions()
-        await show_session_status(self, interaction, sid, back="main")
+        await show_session_status(self, interaction, joined[0], back="main")
 
     @discord.ui.button(
         label="审批",
@@ -792,7 +799,7 @@ class SessionListView(DhapiBaseView):
         for item in self.children:
             custom_id = getattr(item, "custom_id", "")
             if custom_id == "dhapi:sessions:open_current":
-                item.disabled = not bool(self.current_sid())
+                item.disabled = len(self.joined_sids()) != 1
             elif custom_id == "dhapi:sessions:prev":
                 item.disabled = self.page <= 0
             elif custom_id == "dhapi:sessions:next":
@@ -807,15 +814,17 @@ class SessionListView(DhapiBaseView):
             f"当前窗口可见：`{visible_count}` 个",
             f"页码：`{self.page + 1}/{max_page + 1}`（每页最多 25 个）",
         ]
-        current = self.current_sid()
-        if current:
-            lines.append(f"当前：`{current[:8]}`")
+        joined = self.joined_sids()
+        if joined:
+            preview = ", ".join(sid[:8] for sid in joined[:5])
+            suffix = "…" if len(joined) > 5 else ""
+            lines.append(f"本窗口已加入：`{preview}{suffix}`")
         if not sessions:
             lines.append("暂无 session。")
         return make_embed("Session 列表", "\n".join(lines), BRAND)
 
     @discord.ui.button(
-        label="打开当前",
+        label="打开已加入",
         style=discord.ButtonStyle.primary,
         emoji="🎯",
         custom_id="dhapi:sessions:open_current",
@@ -824,17 +833,17 @@ class SessionListView(DhapiBaseView):
     async def open_current_button(
         self, button: discord.ui.Button, interaction: discord.Interaction
     ):
-        sid = self.current_sid()
-        if not sid:
+        joined = self.joined_sids()
+        if len(joined) != 1:
             await self.edit(
                 interaction,
                 self.build_embed(
-                    "尚未选择当前 session。请先从下拉框选择一个 session。"
+                    "本窗口未加入 session 或已加入多个 session。请先从下拉框打开一个 session。"
                 ),
                 self,
             )
             return
-        view = SessionActionView(self.plugin, self.event, sid)
+        view = SessionActionView(self.plugin, self.event, joined[0])
         await self.edit(interaction, view.build_embed(), view)
 
     @discord.ui.button(
@@ -897,6 +906,22 @@ class SessionActionView(DhapiBaseView):
     def __init__(self, plugin, event, sid: str):
         super().__init__(plugin, event)
         self.sid = sid
+        self._sync_join_button()
+
+    def _is_joined(self) -> bool:
+        return self.sid in self.plugin.binding_mgr.get_window_sessions(self.umo)
+
+    def _sync_join_button(self):
+        joined = self._is_joined()
+        for item in self.children:
+            if getattr(item, "custom_id", "") == "dhapi:session:join_leave":
+                item.label = "从此窗口退出" if joined else "在此窗口加入"
+                item.style = (
+                    discord.ButtonStyle.secondary
+                    if joined
+                    else discord.ButtonStyle.success
+                )
+                item.emoji = "➖" if joined else "✅"
 
     def build_embed(self, note: str = "") -> discord.Embed:
         session = self.session_by_id(self.sid)
@@ -908,6 +933,15 @@ class SessionActionView(DhapiBaseView):
             f"**{_session_title(session)}**",
             _session_desc(session),
         ]
+        owners = self.plugin.binding_mgr.get_owners(self.sid)
+        if owners:
+            if len(owners) <= 2:
+                owner_text = ", ".join(_clip(owner, 40) for owner in owners)
+            else:
+                owner_text = ", ".join(_clip(owner, 30) for owner in owners[:2]) + f" +{len(owners) - 2}"
+            desc.append(f"订阅窗口：{owner_text}")
+        else:
+            desc.append("订阅窗口：0")
         if meta.get("path"):
             desc.append(f"路径：`{_clip(meta.get('path'), 500)}`")
         if note:
@@ -915,30 +949,48 @@ class SessionActionView(DhapiBaseView):
         return make_embed("Session 操作", "\n".join(desc), BRAND)
 
     @discord.ui.button(
-        label="切换",
+        label="在此窗口加入",
         style=discord.ButtonStyle.success,
         emoji="✅",
-        custom_id="dhapi:session:switch",
+        custom_id="dhapi:session:join_leave",
         row=0,
     )
-    async def switch_button(
+    async def join_leave_button(
         self, button: discord.ui.Button, interaction: discord.Interaction
     ):
+        if self._is_joined():
+            await self.plugin.state_mgr.leave_session(self.sid, self.umo)
+            await self.plugin.state_mgr.set_user_state(self.event)
+            logger.info(
+                "[dhapi] UI leave sid=%s umo=%s event_session=%s",
+                self.sid[:8],
+                self.umo,
+                self.event.session_id,
+            )
+            self._sync_join_button()
+            await self.edit(
+                interaction,
+                self.build_embed(f"已从当前窗口退出 `{self.sid[:8]}`。"),
+                self,
+            )
+            return
+
         session = self.session_by_id(self.sid)
         flavor = ((session or {}).get("metadata") or {}).get("flavor", "claude")
-        await self.plugin.state_mgr.capture_window(self.sid, self.umo, flavor)
+        await self.plugin.state_mgr.join_session(self.sid, self.umo, flavor)
         await self.plugin.state_mgr.set_user_state(self.event)
         logger.info(
-            "[dhapi] UI switch bound sid=%s umo=%s flavor=%s event_session=%s",
+            "[dhapi] UI join sid=%s umo=%s flavor=%s event_session=%s",
             self.sid[:8],
             self.umo,
             flavor,
             self.event.session_id,
         )
+        self._sync_join_button()
         await self.edit(
             interaction,
             self.build_embed(
-                f"已切换当前 session 到 `{self.sid[:8]}`，并将 Session Owner 绑定到当前窗口。"
+                f"已在当前窗口加入 `{self.sid[:8]}`；通知会投递到所有已加入窗口。"
             ),
             self,
         )
@@ -1131,7 +1183,7 @@ class ConfirmDeleteView(DhapiBaseView):
             return
         ok, msg = await session_ops.delete_session(self.plugin.client, self.sid)
         if ok:
-            await self.plugin.state_mgr.unbind_session(self.sid)
+            await self.plugin.state_mgr.leave_all_session_owners(self.sid)
         await self.refresh_sessions()
         view = (
             SessionListView(self.plugin, self.event)
@@ -1519,14 +1571,21 @@ class ConfigView(DhapiBaseView):
 
     def build_embed(self, note: str = "") -> discord.Embed:
         cfg = self.plugin.config
-        current_sid = self.current_sid()
-        current = current_sid or "未选择"
+        joined = self.joined_sids()
+        current = (
+            joined[0]
+            if len(joined) == 1
+            else "未加入"
+            if not joined
+            else f"{len(joined)} 个"
+        )
         primary = self.plugin.state_mgr.primary_umo(self.event) or "未设置"
         flavor_umos = self.plugin.state_mgr.flavor_primary_umos(self.event)
         session_owner = "未设置"
-        if current_sid:
-            owners = self.plugin.binding_mgr.get_owners(current_sid)
-            session_owner = owners[-1] if owners else "未设置"
+        if len(joined) == 1:
+            owners = self.plugin.binding_mgr.get_owners(joined[0])
+            if owners:
+                session_owner = f"{len(owners)} 个窗口"
         pending_count = len(self.plugin.pending_mgr.flatten_pending(None, None))
         owners_count = len(self.plugin.binding_mgr._session_owners)
         sse_status = "休眠" if self.plugin.sse_listener._hibernated else "运行中"
@@ -1541,8 +1600,8 @@ class ConfigView(DhapiBaseView):
             f"待审批提醒：`{cfg.get('remind_pending', True)}` / `{cfg.get('remind_interval', 180)}s`",
             f"自动审批：`{cfg.get('auto_approve_enabled', False)}`（开启后 24 小时生效，持久化到插件配置）",
             f"SSE：`{sse_status}`",
-            f"当前 Session：`{_clip(current, 120)}`",
-            f"当前 Session Owner：`{_clip(session_owner, 120)}`",
+            f"本窗口已加入 Session：`{_clip(current, 120)}`",
+            f"该 Session 订阅窗口：`{_clip(session_owner, 120)}`",
             f"主通知窗口：`{_clip(primary, 120)}`",
             f"Flavor 通知窗口：`{_clip(flavor_umos or '未设置', 500)}`",
             f"Session 绑定数：`{owners_count}`",
