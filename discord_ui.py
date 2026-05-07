@@ -123,13 +123,7 @@ class DhapiBaseView(discord.ui.View):
         return visible or self.plugin.sessions_cache
 
     def visible_pending_items(self) -> list[tuple[str, str, dict]]:
-        visible_sids = {
-            s.get("id")
-            for s in self.plugin.state_mgr.visible_sessions_for_window(
-                self.event, self.plugin.sessions_cache
-            )
-            if s.get("id")
-        }
+        visible_sids = set(self.plugin.binding_mgr.get_window_sessions(self.umo))
         visible_sids.add(self.umo)
         return self.plugin.pending_mgr.flatten_pending(self.event, visible_sids)
 
@@ -1257,11 +1251,371 @@ def _pending_label(item: tuple[str, str, dict], sessions_cache: list[dict]) -> s
 
 def _pending_desc(req: dict) -> str:
     args = req.get("arguments") or {}
+    if req.get("tool") == "request_user_input" and isinstance(args, dict):
+        questions = args.get("questions") or []
+        return _clip(f"{len(questions)} 个 Codex 交互问题", 100)
     if isinstance(args, dict):
         raw = ", ".join(f"{k}={v}" for k, v in list(args.items())[:3])
     else:
         raw = str(args)
     return _clip(raw or "待处理", 100)
+
+
+def _rui_questions(req: dict | None) -> list[dict]:
+    args = (req or {}).get("arguments") or {}
+    questions = args.get("questions", []) if isinstance(args, dict) else []
+    return questions if isinstance(questions, list) else []
+
+
+def _rui_req(plugin, sid: str, rid: str) -> dict | None:
+    req = plugin.sse_listener.pending.get(sid, {}).get(rid)
+    return req if isinstance(req, dict) else None
+
+
+class RequestUserInputOptionSelect(discord.ui.Select):
+    def __init__(self, source: "RequestUserInputView", qi: int, question: dict):
+        self.qi = qi
+        state = source.state()
+        qid = source.plugin.pending_mgr.question_id(question, qi)
+        selected = (state.get("answers", {}).get(qid) or {}).get("selected", "")
+        options = []
+        for i, opt in enumerate((question.get("options") or [])[:25], 1):
+            label = str(opt.get("label") or f"选项 {i}")
+            desc = str(opt.get("description") or "")
+            options.append(
+                discord.SelectOption(
+                    label=_clip(label, 100),
+                    value=label,
+                    description=_clip(desc, 100) if desc else None,
+                    default=(label == selected),
+                )
+            )
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="无可选项", value="__none__", description="此问题缺少 options"
+                )
+            ]
+        super().__init__(
+            placeholder=_clip(f"第 {qi + 1} 题：选择答案", 100),
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"dhapi:rui:select:{qi}",
+            row=(qi - source.page * source.PAGE_SIZE) * 2,
+            disabled=options[0].value == "__none__",
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: RequestUserInputView = self.view  # type: ignore[assignment]
+        req = view.current_req()
+        if not req:
+            await view.edit(interaction, view.done_embed("请求已处理或不存在。"), None)
+            return
+        view.plugin.pending_mgr.set_rui_answer(
+            view.sid, view.rid, req, self.qi, self.values[0]
+        )
+        await view.edit(interaction, view.build_embed("✅ 已记录选择。"), view.fresh())
+
+
+class RequestUserInputNoteButton(discord.ui.Button):
+    def __init__(self, qi: int, row: int):
+        super().__init__(
+            label=f"第 {qi + 1} 题备注",
+            style=discord.ButtonStyle.secondary,
+            emoji="📝",
+            custom_id=f"dhapi:rui:note:{qi}",
+            row=row,
+        )
+        self.qi = qi
+
+    async def callback(self, interaction: discord.Interaction):
+        view: RequestUserInputView = self.view  # type: ignore[assignment]
+        await interaction.response.send_modal(RequestUserInputNoteModal(view, self.qi))
+
+
+class RequestUserInputSkipNoteButton(discord.ui.Button):
+    def __init__(self, qi: int, row: int):
+        super().__init__(
+            label=f"跳过 {qi + 1}",
+            style=discord.ButtonStyle.secondary,
+            emoji="⏭️",
+            custom_id=f"dhapi:rui:skip_note:{qi}",
+            row=row,
+        )
+        self.qi = qi
+
+    async def callback(self, interaction: discord.Interaction):
+        view: RequestUserInputView = self.view  # type: ignore[assignment]
+        req = view.current_req()
+        if not req:
+            await view.edit(interaction, view.done_embed("请求已处理或不存在。"), None)
+            return
+        view.plugin.pending_mgr.skip_rui_note(view.sid, view.rid, req, self.qi)
+        await view.edit(interaction, view.build_embed("已跳过该题备注。"), view.fresh())
+
+
+class RequestUserInputNoteModal(discord.ui.Modal):
+    def __init__(self, source: "RequestUserInputView", qi: int):
+        super().__init__(title=f"第 {qi + 1} 题补充备注", custom_id=f"dhapi:rui:note_modal:{qi}")
+        self.source = source
+        self.qi = qi
+        req = source.current_req()
+        questions = _rui_questions(req)
+        question = questions[qi] if 0 <= qi < len(questions) else {}
+        state = source.state()
+        qid = source.plugin.pending_mgr.question_id(question, qi)
+        old = (state.get("answers", {}).get(qid) or {}).get("note", "")
+        self.note = discord.ui.InputText(
+            label="补充信息或要求（留空也可）",
+            style=discord.InputTextStyle.long,
+            value=old,
+            required=False,
+            max_length=1000,
+        )
+        self.add_item(self.note)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not self.source.is_admin_id(interaction.user.id):
+            await interaction.response.send_message(
+                "⚠️ 只有 AstrBot 管理员可以回答问题。", ephemeral=True
+            )
+            return
+        req = self.source.current_req()
+        if not req:
+            await interaction.response.send_message("请求已处理或不存在。", ephemeral=True)
+            return
+        note = str(self.note.value or "").strip()
+        self.source.plugin.pending_mgr.set_rui_note(
+            self.source.sid, self.source.rid, req, self.qi, note
+        )
+        await interaction.response.defer(ephemeral=True)
+        view = self.source.fresh()
+        await interaction.edit_original_response(
+            embed=view.build_embed("✅ 已记录备注。"), view=view
+        )
+
+
+class RequestUserInputReviewQuestionSelect(discord.ui.Select):
+    def __init__(self, source: "RequestUserInputReviewView", questions: list[dict]):
+        options = []
+        for qi, question in enumerate(questions[:25]):
+            text = question.get("question") or question.get("id") or f"问题 {qi + 1}"
+            options.append(
+                discord.SelectOption(
+                    label=_clip(f"修改第 {qi + 1} 题", 100),
+                    value=str(qi),
+                    description=_clip(text, 100),
+                )
+            )
+        super().__init__(
+            placeholder="选择要修改的问题",
+            min_values=1,
+            max_values=1,
+            options=options
+            or [discord.SelectOption(label="没有问题", value="__none__")],
+            custom_id="dhapi:rui:review:question",
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: RequestUserInputReviewView = self.view  # type: ignore[assignment]
+        if self.values[0] == "__none__":
+            await interaction.response.defer()
+            return
+        qi = int(self.values[0])
+        page = qi // RequestUserInputView.PAGE_SIZE
+        answer_view = RequestUserInputView(view.plugin, view.event, view.sid, view.rid, page=page)
+        req = answer_view.current_req()
+        if req:
+            state = view.plugin.pending_mgr.get_or_create_rui_state(view.sid, view.rid, req)
+            state["status"] = "answering"
+        await view.edit(interaction, answer_view.build_embed(f"正在修改第 {qi + 1} 题。"), answer_view)
+
+
+class RequestUserInputReviewView(DhapiBaseView):
+    def __init__(self, plugin, event, sid: str, rid: str):
+        super().__init__(plugin, event, timeout=600)
+        self.sid = sid
+        self.rid = rid
+        req = self.current_req()
+        questions = _rui_questions(req)
+        self.add_item(RequestUserInputReviewQuestionSelect(self, questions))
+
+    def current_req(self) -> dict | None:
+        return _rui_req(self.plugin, self.sid, self.rid)
+
+    def build_embed(self, note: str = "") -> discord.Embed:
+        req = self.current_req()
+        if not req:
+            return make_embed("交互问答", "请求已处理或不存在。", BRAND)
+        state = self.plugin.pending_mgr.get_or_create_rui_state(self.sid, self.rid, req)
+        state["status"] = "reviewing"
+        lines = [f"Session：`{self.sid}`", f"Request：`{self.rid}`", ""]
+        for qi, question in enumerate(_rui_questions(req)):
+            qid = self.plugin.pending_mgr.question_id(question, qi)
+            entry = state.get("answers", {}).get(qid) or {}
+            selected = entry.get("selected") or "（未选择）"
+            note_text = entry.get("note") or ("（已跳过）" if entry.get("note_skipped") else "（无）")
+            qtext = question.get("question") or qid
+            lines.append(f"**{qi + 1}. {_clip(qtext, 140)}**")
+            lines.append(f"选择：`{_clip(selected, 200)}`")
+            lines.append(f"备注：{_clip(note_text, 300)}")
+            lines.append("")
+        if note:
+            lines.append(note)
+        return make_embed("审阅 Codex 交互问答", "\n".join(lines), WARN)
+
+    async def _finish_cancel(self, interaction: discord.Interaction, message: str, ok: bool):
+        embed = make_embed("交互问答已取消" if ok else "取消失败", message, OK if ok else ERR)
+        await self.edit(interaction, embed, None)
+
+    @discord.ui.button(label="确认提交", style=discord.ButtonStyle.success, emoji="✅", custom_id="dhapi:rui:confirm", row=1)
+    async def confirm_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        req = self.current_req()
+        if not req:
+            await self.edit(interaction, make_embed("交互问答", "请求已处理或不存在。", BRAND), None)
+            return
+        ok, msg = await self.plugin.pending_mgr.submit_rui_answers(
+            self.plugin.client, self.sid, self.rid, req
+        )
+        await self.edit(
+            interaction,
+            make_embed("交互问答已提交" if ok else "提交失败", msg, OK if ok else ERR),
+            None if ok else self,
+        )
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.danger, emoji="✖️", custom_id="dhapi:rui:cancel_review", row=1)
+    async def cancel_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        ok, msg = await self.plugin.pending_mgr.cancel_rui(self.plugin.client, self.sid, self.rid)
+        await self._finish_cancel(interaction, msg, ok)
+
+    async def on_timeout(self) -> None:
+        try:
+            await self.plugin.pending_mgr.cancel_rui(self.plugin.client, self.sid, self.rid)
+        except Exception as exc:
+            logger.warning("request_user_input review timeout cleanup failed: %s", exc)
+
+
+class RequestUserInputView(DhapiBaseView):
+    PAGE_SIZE = 2
+
+    def __init__(self, plugin, event, sid: str, rid: str, *, page: int = 0):
+        super().__init__(plugin, event, timeout=600)
+        self.sid = sid
+        self.rid = rid
+        self.page = max(0, int(page or 0))
+        self._add_controls()
+
+    def current_req(self) -> dict | None:
+        req = _rui_req(self.plugin, self.sid, self.rid)
+        return req if self.plugin.pending_mgr.is_request_user_input(req) else None
+
+    def state(self) -> dict:
+        req = self.current_req()
+        return self.plugin.pending_mgr.get_or_create_rui_state(self.sid, self.rid, req) if req else {}
+
+    def fresh(self) -> "RequestUserInputView":
+        return RequestUserInputView(self.plugin, self.event, self.sid, self.rid, page=self.page)
+
+    def _add_controls(self):
+        req = self.current_req()
+        questions = _rui_questions(req)
+        if not req or not questions:
+            return
+        max_page = max(0, (len(questions) - 1) // self.PAGE_SIZE)
+        self.page = min(self.page, max_page)
+        start = self.page * self.PAGE_SIZE
+        for offset, qi in enumerate(range(start, min(len(questions), start + self.PAGE_SIZE))):
+            row_base = offset * 2
+            self.add_item(RequestUserInputOptionSelect(self, qi, questions[qi]))
+            self.add_item(RequestUserInputNoteButton(qi, row_base + 1))
+            self.add_item(RequestUserInputSkipNoteButton(qi, row_base + 1))
+        if self.page > 0:
+            self.add_item(RequestUserInputPageButton("上一页", "⬅️", self.page - 1))
+        if self.page < max_page:
+            self.add_item(RequestUserInputPageButton("下一页", "➡️", self.page + 1))
+        self.add_item(RequestUserInputReviewButton())
+        self.add_item(RequestUserInputCancelButton())
+
+    def done_embed(self, text: str) -> discord.Embed:
+        return make_embed("Codex 交互问答", text, BRAND)
+
+    def build_embed(self, note: str = "") -> discord.Embed:
+        req = self.current_req()
+        if not req:
+            return self.done_embed("请求已处理或不存在。")
+        state = self.plugin.pending_mgr.get_or_create_rui_state(self.sid, self.rid, req)
+        questions = _rui_questions(req)
+        complete = self.plugin.pending_mgr.is_rui_complete(self.sid, self.rid, req)
+        max_page = max(0, (len(questions) - 1) // self.PAGE_SIZE)
+        lines = [
+            "请为每个问题选择一个选项；备注可补充，也可跳过。",
+            f"进度：`{'已完成，可审阅' if complete else '回答中'}` · 控件页 `{self.page + 1}/{max_page + 1}`",
+            "",
+        ]
+        for qi, question in enumerate(questions):
+            qid = self.plugin.pending_mgr.question_id(question, qi)
+            entry = state.get("answers", {}).get(qid) or {}
+            selected = entry.get("selected") or "（未选择）"
+            note_text = entry.get("note") or ("（已跳过）" if entry.get("note_skipped") else "（无）")
+            qtext = question.get("question") or qid
+            lines.append(f"**{qi + 1}. [{_clip(qid, 32)}] {_clip(qtext, 180)}**")
+            for oi, opt in enumerate(question.get("options") or [], 1):
+                desc = f" — {opt.get('description')}" if opt.get("description") else ""
+                label = str(opt.get("label") or f"选项 {oi}")
+                mark = "✅ " if label == selected else ""
+                lines.append(f"　{mark}`{oi}` {_clip(label + desc, 220)}")
+            lines.append(f"选择：`{_clip(selected, 200)}`")
+            lines.append(f"备注：{_clip(note_text, 300)}")
+            lines.append("")
+        if note:
+            lines.append(note)
+        return make_embed("Codex request_user_input", "\n".join(lines), WARN)
+
+    async def on_timeout(self) -> None:
+        try:
+            await self.plugin.pending_mgr.cancel_rui(self.plugin.client, self.sid, self.rid)
+        except Exception as exc:
+            logger.warning("request_user_input timeout cleanup failed: %s", exc)
+
+
+class RequestUserInputPageButton(discord.ui.Button):
+    def __init__(self, label: str, emoji: str, page: int):
+        super().__init__(label=label, emoji=emoji, style=discord.ButtonStyle.secondary, row=4)
+        self.target_page = page
+
+    async def callback(self, interaction: discord.Interaction):
+        view: RequestUserInputView = self.view  # type: ignore[assignment]
+        new_view = RequestUserInputView(view.plugin, view.event, view.sid, view.rid, page=self.target_page)
+        await view.edit(interaction, new_view.build_embed(), new_view)
+
+
+class RequestUserInputReviewButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="进入审阅", emoji="📋", style=discord.ButtonStyle.primary, row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: RequestUserInputView = self.view  # type: ignore[assignment]
+        req = view.current_req()
+        if not req:
+            await view.edit(interaction, view.done_embed("请求已处理或不存在。"), None)
+            return
+        if not view.plugin.pending_mgr.is_rui_complete(view.sid, view.rid, req):
+            await view.edit(interaction, view.build_embed("⚠️ 仍有问题未选择答案。"), view.fresh())
+            return
+        review = RequestUserInputReviewView(view.plugin, view.event, view.sid, view.rid)
+        await view.edit(interaction, review.build_embed(), review)
+
+
+class RequestUserInputCancelButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="取消", emoji="✖️", style=discord.ButtonStyle.danger, row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: RequestUserInputView = self.view  # type: ignore[assignment]
+        ok, msg = await view.plugin.pending_mgr.cancel_rui(view.plugin.client, view.sid, view.rid)
+        await view.edit(interaction, make_embed("交互问答已取消" if ok else "取消失败", msg, OK if ok else ERR), None)
 
 
 class PendingSelect(discord.ui.Select):
@@ -1326,7 +1680,12 @@ class ApprovalView(DhapiBaseView):
                 f"Request ID：`{rid}`",
             ]
             args = req.get("arguments") or {}
-            desc_lines.append(f"参数：```text\n{_clip(args, 1200)}\n```")
+            if self.plugin.pending_mgr.is_request_user_input(req):
+                desc_lines.append("这是 Codex 交互问答请求，请点击“批准/回答”进入原生问答流程。")
+                for qi, q in enumerate(_rui_questions(req), 1):
+                    desc_lines.append(f"{qi}. {_clip(q.get('question') or q.get('id') or '问题', 220)}")
+            else:
+                desc_lines.append(f"参数：```text\n{_clip(args, 1200)}\n```")
             desc = "\n".join(desc_lines)
         if note:
             desc += f"\n\n{note}"
@@ -1381,6 +1740,11 @@ class ApprovalView(DhapiBaseView):
         item = self.selected_item()
         if not item:
             await self.edit(interaction, self.build_embed("没有可批准的请求。"), self)
+            return
+        sid, rid, req = item
+        if self.plugin.pending_mgr.is_request_user_input(req):
+            view = RequestUserInputView(self.plugin, self.event, sid, rid)
+            await self.edit(interaction, view.build_embed(), view)
             return
         ok, msg = await self._approve_item(*item)
         view = ApprovalView(self.plugin, self.event)

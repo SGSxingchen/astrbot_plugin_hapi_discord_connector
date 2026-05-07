@@ -144,6 +144,7 @@ class HapiDiscordConnectorPlugin(Star):
 
         # 待审批管理器
         self.pending_mgr = PendingManager(self.sse_listener)
+        self.sse_listener.pending_mgr = self.pending_mgr
 
         # summary 模式消息条数
         self._summary_msg_count = self.config.get("summary_msg_count", 5)
@@ -265,6 +266,44 @@ class HapiDiscordConnectorPlugin(Star):
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_list_commands(event, topic)
+
+    @filter.llm_tool(name="dhapi_coding_list_pending_questions")
+    async def tool_list_pending_questions(
+        self, event: AstrMessageEvent, session_id: str = ""
+    ) -> str:
+        """列出当前待处理的 Codex request_user_input 交互问答请求（只读）。
+
+        Args:
+            session_id(string): 可选，显式 session ID；不传时列出当前窗口可见请求。
+        """
+        if not self._is_discord_event(event):
+            return "dhapi 工具仅支持 Discord 平台。"
+        return await self.llm_integration.tool_list_pending_questions(event, session_id)
+
+    @filter.llm_tool(name="dhapi_coding_answer_request_user_input")
+    async def tool_answer_request_user_input(
+        self,
+        event: AstrMessageEvent,
+        request_index: str,
+        question_number: int,
+        option: str,
+        note: str = "",
+        session_id: str = "",
+    ) -> str:
+        """TODO 入口：Codex request_user_input 代答，当前只提示使用 Discord 原生审阅流程。
+
+        Args:
+            request_index(string): 审批序号。
+            question_number(number): 题号。
+            option(string): 选项序号或选项文本。
+            note(string): 可选备注。
+            session_id(string): 可选，显式 session ID；不传时当前窗口必须只加入一个 session。
+        """
+        if not self._is_discord_event(event):
+            return "dhapi 工具仅支持 Discord 平台。"
+        return await self.llm_integration.tool_answer_request_user_input(
+            event, request_index, question_number, option, note, session_id
+        )
 
     @filter.llm_tool(name="dhapi_coding_send_message")
     async def tool_send_message(
@@ -402,6 +441,116 @@ class HapiDiscordConnectorPlugin(Star):
             return f"⚠ SSE 连接已连续失败 {n} 次，正在后台重连...\n"
         return None
 
+    def _find_pending_by_index(
+        self,
+        index_text: str,
+        event: AstrMessageEvent | None = None,
+        visible_sids: set[str] | None = None,
+    ):
+        try:
+            wanted = int(index_text)
+        except (TypeError, ValueError):
+            return None
+        for sid, rid, req in self.pending_mgr.flatten_pending(event, visible_sids):
+            try:
+                if int((req or {}).get("index") or 0) == wanted:
+                    return sid, rid, req
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    async def _handle_text_answer(self, event: AstrMessageEvent) -> bool:
+        """文本兜底：/dhapi answer <审批序号> <题号> <选项序号|label> [备注]。"""
+        text = (event.message_str or "").strip()
+        parts = text.split()
+        if parts and parts[0].lower().lstrip("/") == "dhapi":
+            parts = parts[1:]
+        if not parts or parts[0].lower() != "answer":
+            return False
+        if not self._is_admin(event):
+            await event.send(event.plain_result("⚠️ 只有 AstrBot 管理员可以回答 DHAPI 问题。"))
+            return True
+        visible_sids = set(self.binding_mgr.get_window_sessions(event.unified_msg_origin))
+        visible_sids.add(event.unified_msg_origin)
+        if len(parts) == 1:
+            items = [
+                (sid, rid, req)
+                for sid, rid, req in self.pending_mgr.flatten_pending(event, visible_sids)
+                if self.pending_mgr.is_request_user_input(req)
+            ]
+            if not items:
+                await event.send(event.plain_result("当前没有 Codex 交互问答请求。"))
+                return True
+            lines = ["Codex 交互问答请求："]
+            for sid, rid, req in items:
+                qs = self.pending_mgr._question_list(req)
+                lines.append(
+                    f"  #{req.get('index', '?')} session {sid[:8]} / request {rid[:8]}：{len(qs)} 题"
+                )
+            lines.append(
+                "\n用法：/dhapi answer <审批序号> <题号> <选项序号|选项文本> [备注]\n"
+                "提交：/dhapi answer <审批序号> confirm；取消：/dhapi answer <审批序号> cancel"
+            )
+            await event.send(event.plain_result("\n".join(lines)))
+            return True
+
+        found = self._find_pending_by_index(parts[1], event, visible_sids)
+        if not found:
+            await event.send(event.plain_result("❌ 找不到该审批序号。"))
+            return True
+        sid, rid, req = found
+        if not self.pending_mgr.is_request_user_input(req):
+            await event.send(event.plain_result("❌ 该序号不是 Codex 交互问答请求。"))
+            return True
+
+        action = parts[2].lower() if len(parts) >= 3 else ""
+        if action in {"confirm", "y", "提交"}:
+            ok, msg = await self.pending_mgr.submit_rui_answers(self.client, sid, rid, req)
+            await event.send(event.plain_result(("✅ " if ok else "❌ ") + msg))
+            return True
+        if action in {"cancel", "n", "取消"}:
+            ok, msg = await self.pending_mgr.cancel_rui(self.client, sid, rid)
+            await event.send(event.plain_result(("✅ " if ok else "❌ ") + msg))
+            return True
+        if len(parts) < 4:
+            await event.send(
+                event.plain_result(
+                    "用法：/dhapi answer <审批序号> <题号> <选项序号|选项文本> [备注]"
+                )
+            )
+            return True
+
+        try:
+            qi = int(parts[2]) - 1
+        except ValueError:
+            await event.send(event.plain_result("❌ 题号必须是数字。"))
+            return True
+        questions = self.pending_mgr._question_list(req)
+        if not (0 <= qi < len(questions)):
+            await event.send(event.plain_result("❌ 题号超出范围。"))
+            return True
+        option_text = parts[3]
+        opts = questions[qi].get("options") or []
+        if option_text.isdigit() and 1 <= int(option_text) <= len(opts):
+            label = str(opts[int(option_text) - 1].get("label") or "")
+        else:
+            label = option_text
+        note = " ".join(parts[4:]).strip()
+        self.pending_mgr.set_rui_answer(sid, rid, req, qi, label)
+        if note and note.lower() != "n":
+            self.pending_mgr.set_rui_note(sid, rid, req, qi, note)
+        elif note.lower() == "n":
+            self.pending_mgr.skip_rui_note(sid, rid, req, qi)
+
+        complete = self.pending_mgr.is_rui_complete(sid, rid, req)
+        payload_preview = self.pending_mgr.build_rui_payload(sid, rid, req)
+        lines = [f"✅ 已记录第 {qi + 1} 题。", f"当前汇总：{payload_preview}"]
+        lines.append(
+            f"下一步：{'/dhapi answer ' + parts[1] + ' confirm 提交，或继续修改题目。' if complete else '继续回答剩余题目。'}"
+        )
+        await event.send(event.plain_result("\n".join(lines)))
+        return True
+
     # ──── 生命周期 ────
 
     async def initialize(self):
@@ -496,6 +645,9 @@ class HapiDiscordConnectorPlugin(Star):
         event.call_llm = True
         webhook = getattr(event, "interaction_followup_webhook", None)
         if webhook is None:
+            if await self._handle_text_answer(event):
+                event.stop_event()
+                return
             logger.info(
                 "忽略非 slash /dhapi 文本调用：仅支持 Discord slash command UI。"
             )
