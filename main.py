@@ -11,7 +11,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
-from . import session_ops
+from . import formatters, session_ops
 from .binding_manager import BindingManager
 from .cf_access import CfAccessManager
 from .agent_final_trigger import AgentFinalPayload, AgentFinalTrigger
@@ -370,6 +370,38 @@ class HapiDiscordConnectorPlugin(Star):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_delete_session(event, session_id)
 
+    @filter.llm_tool(name="dhapi_coding_set_plan_mode")
+    async def tool_set_plan_mode(
+        self, event: AstrMessageEvent, enabled: bool, session_id: str = ""
+    ) -> str:
+        """切换当前或指定 HAPI session 的 Plan Mode；需要用户审批。
+
+        Args:
+            enabled(boolean): true=开启 Plan Mode，false=关闭 Plan Mode。
+            session_id(string): 可选，显式 session ID；不传时当前窗口必须只加入一个 session。
+        """
+        if not self._is_discord_event(event):
+            return "dhapi 工具仅支持 Discord 平台。"
+        return await self.llm_integration.tool_set_plan_mode(
+            event, enabled, session_id
+        )
+
+    @filter.llm_tool(name="dhapi_coding_set_reasoning_effort")
+    async def tool_set_reasoning_effort(
+        self, event: AstrMessageEvent, effort: str, session_id: str = ""
+    ) -> str:
+        """运行中切换 Codex reasoning effort；需要用户审批。
+
+        Args:
+            effort(string): none/minimal/low/medium/high/xhigh，或 inherit/default/auto 继承默认。
+            session_id(string): 可选，显式 session ID；不传时当前窗口必须只加入一个 session。
+        """
+        if not self._is_discord_event(event):
+            return "dhapi 工具仅支持 Discord 平台。"
+        return await self.llm_integration.tool_set_reasoning_effort(
+            event, effort, session_id
+        )
+
     @filter.llm_tool(name="dhapi_coding_execute_command")
     async def tool_execute_command(self, event: AstrMessageEvent, command: str) -> str:
         """兼容旧工具名；文本子命令已废弃，请改用专用 dhapi_coding_* 工具。
@@ -401,6 +433,107 @@ class HapiDiscordConnectorPlugin(Star):
         if n > 0:
             return f"⚠ SSE 连接已连续失败 {n} 次，正在后台重连...\n"
         return None
+
+    def _cached_session(self, sid: str | None) -> dict | None:
+        if not sid:
+            return None
+        return next((s for s in self.sessions_cache if s.get("id") == sid), None)
+
+    def _update_cached_session(self, sid: str, **fields):
+        session = self._cached_session(sid)
+        if session is None:
+            session = {"id": sid, "metadata": {}}
+            self.sessions_cache.append(session)
+        session.update(fields)
+
+    @staticmethod
+    def _session_flavor(session: dict | None, detail: dict | None = None) -> str:
+        source = detail or session or {}
+        meta = source.get("metadata") or {}
+        flavor = str(meta.get("flavor") or "").strip().lower()
+        if flavor:
+            return flavor
+        meta = (session or {}).get("metadata") or {}
+        return str(meta.get("flavor") or "claude").strip().lower()
+
+    async def set_plan_mode_for_session(
+        self, sid: str, enabled: bool | None = None
+    ) -> tuple[bool, str, bool | None]:
+        """设置/toggle Plan Mode，返回 (ok, msg, enabled_after)。"""
+        try:
+            detail = await session_ops.fetch_session_detail(self.client, sid)
+        except Exception as exc:
+            return False, f"获取 session 状态失败: {exc}", None
+
+        flavor = self._session_flavor(self._cached_session(sid), detail)
+        if flavor not in ("claude", "codex"):
+            return False, "Plan Mode 仅支持 Claude / Codex session", None
+
+        if flavor == "claude":
+            current = detail.get("permissionMode", "default")
+            target = "plan" if enabled is True else "default" if enabled is False else (
+                "default" if current == "plan" else "plan"
+            )
+            ok, msg = await session_ops.set_permission_mode(self.client, sid, target)
+            if ok:
+                self._update_cached_session(sid, permissionMode=target)
+        else:
+            current = detail.get("collaborationMode", "default")
+            target = "plan" if enabled is True else "default" if enabled is False else (
+                "default" if current == "plan" else "plan"
+            )
+            ok, msg = await session_ops.set_collaboration_mode(self.client, sid, target)
+            if ok:
+                self._update_cached_session(sid, collaborationMode=target)
+
+        return ok, msg, target == "plan" if ok else None
+
+    @staticmethod
+    def normalize_codex_reasoning_effort(effort: str) -> tuple[bool, str | None, str]:
+        from .constants import (
+            CODEX_REASONING_EFFORT_INHERIT_ALIASES,
+            CODEX_REASONING_EFFORT_VALUES,
+        )
+
+        value = (effort or "").strip().lower()
+        if value in CODEX_REASONING_EFFORT_INHERIT_ALIASES:
+            return True, None, ""
+        if value in CODEX_REASONING_EFFORT_VALUES:
+            return True, value, ""
+        valid = ", ".join(CODEX_REASONING_EFFORT_VALUES)
+        return False, None, f"无效 reasoning effort: {effort}；可用: inherit, {valid}"
+
+    async def set_reasoning_effort_for_session(
+        self, sid: str, effort: str
+    ) -> tuple[bool, str, str | None]:
+        """运行中设置 Codex reasoning effort，返回 (ok, msg, normalized_effort)。"""
+        ok, normalized, err = self.normalize_codex_reasoning_effort(effort)
+        if not ok:
+            return False, err, None
+
+        session = self._cached_session(sid)
+        try:
+            detail = await session_ops.fetch_session_detail(self.client, sid)
+        except Exception:
+            detail = None
+        flavor = self._session_flavor(session, detail)
+        if flavor != "codex":
+            return False, "Reasoning effort 运行中切换仅支持 Codex session", None
+
+        ok, msg = await session_ops.set_codex_reasoning_effort(
+            self.client, sid, normalized
+        )
+        if ok:
+            self._update_cached_session(sid, modelReasoningEffort=normalized)
+        return ok, msg, normalized
+
+    async def push_plan_mode_notice(self, sid: str, enabled: bool):
+        """通过 Discord 推送通知告知 Plan Mode 切换结果。"""
+        label = formatters.session_label_short(sid, self.sessions_cache)
+        action = "已开启" if enabled else "已关闭"
+        await self.notification_mgr.push_notification(
+            f"{label}\n此窗口 Plan 模式{action}", sid, self.sessions_cache
+        )
 
     # ──── 生命周期 ────
 
@@ -507,6 +640,67 @@ class HapiDiscordConnectorPlugin(Star):
         if not self._is_admin(event):
             await webhook.send(
                 content="⚠️ 只有 AstrBot 管理员可以打开 DHAPI 面板。",
+                wait=True,
+                ephemeral=True,
+            )
+            event.stop_event()
+            return
+
+        parts = event.message_str.strip().split(maxsplit=2)
+        subcmd = parts[1].lower() if len(parts) > 1 else ""
+        subarg = parts[2] if len(parts) > 2 else ""
+        if subcmd in {"plan", "effort"}:
+            await self.state_mgr.ensure_primary_session(event)
+            await self.state_mgr.set_user_state(event)
+            await self._refresh_sessions()
+            if subcmd == "plan":
+                sid, reason = self.state_mgr.resolve_target_sid(event, subarg)
+                if not sid:
+                    msg = (
+                        "当前窗口已加入多个 session，请提供 session_id。"
+                        if reason == "ambiguous"
+                        else "当前窗口未加入任何 session，请先加入或提供 session_id。"
+                    )
+                    await webhook.send(content=f"❌ {msg}", wait=True, ephemeral=True)
+                    event.stop_event()
+                    return
+                ok, msg, enabled = await self.set_plan_mode_for_session(sid)
+                if ok and enabled is not None:
+                    await self.push_plan_mode_notice(sid, enabled)
+                    await webhook.send(
+                        content="✅ Plan Mode 已切换，并已推送通知。",
+                        wait=True,
+                        ephemeral=True,
+                    )
+                else:
+                    await webhook.send(content=f"❌ {msg}", wait=True, ephemeral=True)
+                event.stop_event()
+                return
+
+            effort_parts = subarg.split(maxsplit=1)
+            effort = effort_parts[0] if effort_parts else ""
+            target = effort_parts[1] if len(effort_parts) > 1 else ""
+            if not effort:
+                await webhook.send(
+                    content="❌ 用法：`/dhapi effort <none|minimal|low|medium|high|xhigh>`",
+                    wait=True,
+                    ephemeral=True,
+                )
+                event.stop_event()
+                return
+            sid, reason = self.state_mgr.resolve_target_sid(event, target)
+            if not sid:
+                msg = (
+                    "当前窗口已加入多个 session，请提供 session_id。"
+                    if reason == "ambiguous"
+                    else "当前窗口未加入任何 session，请先加入或提供 session_id。"
+                )
+                await webhook.send(content=f"❌ {msg}", wait=True, ephemeral=True)
+                event.stop_event()
+                return
+            ok, msg, _ = await self.set_reasoning_effort_for_session(sid, effort)
+            await webhook.send(
+                content=("✅ " if ok else "❌ ") + msg,
                 wait=True,
                 ephemeral=True,
             )

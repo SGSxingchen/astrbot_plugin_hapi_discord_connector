@@ -25,6 +25,9 @@ CODEX_REASONING_EFFORT_VALUES = [
     value for value, _ in CODEX_REASONING_EFFORT_OPTIONS if value
 ]
 
+# Codex reasoning effort 运行中切换时，以下值表示继承默认设置（API 传 None）。
+CODEX_REASONING_EFFORT_INHERIT_ALIASES = {"", "inherit", "default", "auto", "继承"}
+
 # 支持的 Agent 类型
 AGENTS = ["claude", "codex", "gemini", "opencode"]
 
