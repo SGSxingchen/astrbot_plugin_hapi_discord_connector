@@ -3,6 +3,79 @@
 from .hapi_client import AsyncHapiClient
 
 
+def session_state(session: dict | None) -> str:
+    """返回 session state；兼容旧字段，无法判断时返回 unknown。"""
+    if not session:
+        return "unknown"
+    state = str(session.get("state") or "").strip().lower()
+    if state:
+        return state
+    if session.get("thinking"):
+        return "thinking"
+    if session.get("active"):
+        return "active"
+    return "unknown"
+
+
+def find_session(sessions: list[dict], sid: str | None) -> dict | None:
+    """按完整 session id 在缓存中查找。"""
+    if not sid:
+        return None
+    return next((s for s in sessions if s.get("id") == sid), None)
+
+
+def resolve_session_target(
+    sessions: list[dict], target: str = "", current_sid: str | None = None
+) -> tuple[bool, str | None, str]:
+    """按当前 session、序号或 ID 前缀解析目标 session。"""
+    target = (target or "").strip()
+    if not target:
+        if current_sid:
+            return True, current_sid, ""
+        return False, None, "请先选择一个 session，或使用 `/dhapi resume <序号|ID前缀>`"
+
+    if target.isdigit():
+        idx = int(target)
+        if 1 <= idx <= len(sessions):
+            return True, sessions[idx - 1].get("id"), ""
+
+    matches = [s for s in sessions if str(s.get("id", "")).startswith(target)]
+    if len(matches) == 1:
+        return True, matches[0].get("id"), ""
+    if len(matches) > 1:
+        labels = "\n".join(f"  {s.get('id', '')[:8]}..." for s in matches[:10])
+        more = "\n  ..." if len(matches) > 10 else ""
+        return False, None, f"匹配到 {len(matches)} 个 session，请提供更长的 ID 前缀:\n{labels}{more}"
+    return False, None, f"未找到匹配的 session: {target}"
+
+
+def resume_precheck(session: dict | None, sid: str) -> tuple[bool, str]:
+    """恢复前状态预检查：只允许 inactive session。"""
+    if not session:
+        return False, f"未找到 session [{sid[:8]}]，请刷新 session 列表后重试"
+    state = session_state(session)
+    if state != "inactive":
+        return False, f"Session [{sid[:8]}] 当前状态为 {state}，只能恢复 inactive 状态的 session"
+    return True, ""
+
+
+async def resume_precheck_latest(
+    client: AsyncHapiClient, sid: str, cached_session: dict | None = None
+) -> tuple[bool, str, dict | None]:
+    """用最新详情进行 resume 状态预检查，避免给用户暴露无意义后端错误。"""
+    session = cached_session
+    try:
+        latest = await fetch_session_detail(client, sid)
+        if cached_session and latest and not latest.get("state"):
+            latest = {**cached_session, **latest}
+        session = latest
+    except Exception:
+        # 如果详情接口失败，仍使用缓存做预检查；缓存也没有时给出友好提示。
+        pass
+    ok, msg = resume_precheck(session, sid)
+    return ok, msg, session
+
+
 async def fetch_sessions(client: AsyncHapiClient) -> list[dict]:
     """获取所有 session 列表"""
     resp = await client.get("/api/sessions")
@@ -160,7 +233,7 @@ async def resume_session(
     client: AsyncHapiClient, sid: str
 ) -> tuple[bool, str, str | None]:
     """恢复 inactive session，返回 (成功, 描述, 恢复后的 session_id 或 None)"""
-    resp = await client.post(f"/api/sessions/{sid}/resume", json={})
+    resp = await client.resume_session(sid)
     if resp.ok:
         data = await resp.json()
         resp.release()

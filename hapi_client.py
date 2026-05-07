@@ -203,6 +203,10 @@ class AsyncHapiClient:
     async def delete(self, path: str, **kwargs) -> aiohttp.ClientResponse:
         return await self.request("DELETE", path, **kwargs)
 
+    async def resume_session(self, sid: str) -> aiohttp.ClientResponse:
+        """POST /api/sessions/{sid}/resume."""
+        return await self.post(f"/api/sessions/{sid}/resume", json={})
+
     async def get_json(self, path: str, **kwargs) -> dict:
         """GET 并返回 JSON"""
         resp = await self.get(path, **kwargs)

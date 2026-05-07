@@ -363,6 +363,17 @@ class HapiDiscordConnectorPlugin(Star):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_archive_session(event, session_id)
 
+    @filter.llm_tool(name="dhapi_coding_resume_session")
+    async def tool_resume_session(self, event: AstrMessageEvent, session_id: str = "") -> str:
+        """恢复已归档的 inactive HAPI session；需要用户审批。
+
+        Args:
+            session_id(string): 可选，显式 session ID；不传时当前窗口必须只加入一个 session。
+        """
+        if not self._is_discord_event(event):
+            return "dhapi 工具仅支持 Discord 平台。"
+        return await self.llm_integration.tool_resume_session(event, session_id)
+
     @filter.llm_tool(name="dhapi_coding_delete_session")
     async def tool_delete_session(self, event: AstrMessageEvent, session_id: str = "") -> str:
         """删除 HAPI session；危险操作，需要用户审批。"""
@@ -390,6 +401,72 @@ class HapiDiscordConnectorPlugin(Star):
         except Exception as e:
             logger.warning("刷新 session 列表失败: %s", e)
             raise
+
+    @staticmethod
+    def _strip_dhapi_prefix(text: str) -> str:
+        """Strip a leading /dhapi command prefix and return the remainder."""
+        normalized = (text or "").strip()
+        lowered = normalized.lower()
+        if lowered == "/dhapi":
+            return ""
+        if lowered.startswith("/dhapi "):
+            return normalized[7:].strip()
+        if lowered == "dhapi":
+            return ""
+        if lowered.startswith("dhapi "):
+            return normalized[6:].strip()
+        return normalized
+
+    def _extract_dhapi_remainder(self, event: AstrMessageEvent, raw: str = "") -> str:
+        """Choose the most complete /dhapi remainder from raw and message text."""
+        message_str = (getattr(event, "message_str", "") or "").strip()
+        raw_stripped = raw.strip() if raw else ""
+        from_message = self._strip_dhapi_prefix(message_str)
+        if raw_stripped and len(raw_stripped.split()) >= len(from_message.split()):
+            return self._strip_dhapi_prefix(raw_stripped)
+        return from_message
+
+    async def _resume_session_for_event(
+        self, event: AstrMessageEvent, target: str = ""
+    ) -> str:
+        """Resolve, precheck and resume an archived/inactive session."""
+        await self.state_mgr.ensure_primary_session(event)
+        await self.state_mgr.set_user_state(event)
+        await self._refresh_sessions()
+
+        current_sid = self.state_mgr.resolve_target_sid(event, "")[0]
+        ok, sid, msg = session_ops.resolve_session_target(
+            self.sessions_cache,
+            target,
+            current_sid,
+        )
+        if not ok or not sid:
+            return msg
+
+        cached = session_ops.find_session(self.sessions_cache, sid)
+        ok, msg, _latest = await session_ops.resume_precheck_latest(
+            self.client, sid, cached
+        )
+        if not ok:
+            return msg
+
+        ok, msg, resumed_sid = await session_ops.resume_session(self.client, sid)
+        if not ok or not resumed_sid:
+            return msg
+
+        await self._refresh_sessions()
+        resumed = session_ops.find_session(self.sessions_cache, resumed_sid)
+        flavor = (
+            ((resumed or {}).get("metadata") or {}).get("flavor")
+            or ((cached or {}).get("metadata") or {}).get("flavor")
+            or "claude"
+        )
+        if resumed_sid != sid:
+            await self.state_mgr.leave_all_session_owners(sid)
+        await self.state_mgr.join_session(resumed_sid, event.unified_msg_origin, flavor)
+        await self.state_mgr.set_user_state(event)
+        msg += f"\n已自动切换到恢复后的 session [{flavor}] {resumed_sid[:8]}..."
+        return msg
 
     def _conn_warning(self) -> str | None:
         """SSE 连接异常时返回警告文本，正常时返回 None"""
@@ -487,14 +564,33 @@ class HapiDiscordConnectorPlugin(Star):
     # ──── Discord UI 入口 ────
 
     @filter.command("dhapi")
-    async def handle_hapi(self, event: AstrMessageEvent):
+    async def handle_hapi(self, event: AstrMessageEvent, raw: str = ""):
         """打开 HAPI Discord 原生交互面板。"""
         if not self._is_discord_event(event):
             return
         self.agent_final_trigger.remember_event(event)
 
-        event.call_llm = True
+        remainder = self._extract_dhapi_remainder(event, raw)
+        parts = remainder.split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else ""
+        subarg = parts[1].strip() if len(parts) > 1 else ""
         webhook = getattr(event, "interaction_followup_webhook", None)
+
+        if subcmd == "resume":
+            if not self._is_admin(event):
+                yield event.plain_result("⚠️ 此命令仅限管理员使用")
+                event.stop_event()
+                return
+            try:
+                text = await self._resume_session_for_event(event, subarg)
+            except Exception as exc:
+                logger.warning("[dhapi] resume failed: %s", exc, exc_info=True)
+                text = f"恢复失败：{type(exc).__name__}: {exc}"
+            yield event.plain_result(text)
+            event.stop_event()
+            return
+
+        event.call_llm = True
         if webhook is None:
             logger.info(
                 "忽略非 slash /dhapi 文本调用：仅支持 Discord slash command UI。"

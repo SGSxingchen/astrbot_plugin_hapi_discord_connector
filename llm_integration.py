@@ -70,6 +70,7 @@ class LLMIntegration:
             "dhapi_coding_get_config_status",
             "dhapi_coding_change_config",
             "dhapi_coding_archive_session",
+            "dhapi_coding_resume_session",
             "dhapi_coding_delete_session",
         }
 
@@ -87,6 +88,7 @@ class LLMIntegration:
             "dhapi_coding_change_config",
             "dhapi_coding_stop_message",
             "dhapi_coding_archive_session",
+            "dhapi_coding_resume_session",
             "dhapi_coding_delete_session",
             "dhapi_coding_execute_command",
         }
@@ -809,6 +811,36 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             await self.plugin._refresh_sessions()
         return msg
 
+    async def tool_resume_session(self, event: AstrMessageEvent, session_id: str = ""):
+        """恢复 archived/inactive session。危险操作，必须审批。"""
+        sid, error = self._resolve_sid_text(event, session_id)
+        if error:
+            return error
+        if not self.validate_sid(sid):
+            return self._missing_sid_text(sid)
+
+        cached = session_ops.find_session(self.sessions_cache, sid)
+        ok, msg, _latest = await session_ops.resume_precheck_latest(
+            self.client, sid, cached
+        )
+        if not ok:
+            return msg
+
+        approved, reason = await self._require_approval(
+            "dhapi_coding_resume_session",
+            {"session_id": sid[:8]},
+            event,
+        )
+        if not approved:
+            if reason == "timeout":
+                return "操作超时：60秒内未收到用户审批。请提醒用户打开 /dhapi 审批面板处理。"
+            elif reason == "notification_failed":
+                return "操作失败：无法发送审批通知到用户。请检查是否已绑定 session。"
+            else:
+                return "操作已被用户拒绝，请停止工具调用，先交流清楚问题"
+
+        return await self.plugin._resume_session_for_event(event, sid)
+
     async def tool_delete_session(self, event: AstrMessageEvent, session_id: str = ""):
         """删除 HAPI session。危险操作，必须审批。"""
         sid, error = self._resolve_sid_text(event, session_id)
@@ -840,5 +872,6 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             "文本 /dhapi 子命令已废弃。Discord 用户请使用 /dhapi 打开交互面板；"
             "LLM 请直接调用 dhapi_coding_list_sessions / dhapi_coding_join_session / "
             "dhapi_coding_send_message / dhapi_coding_stop_message / "
-            "dhapi_coding_archive_session / dhapi_coding_delete_session 等专用工具。"
+            "dhapi_coding_archive_session / dhapi_coding_resume_session / "
+            "dhapi_coding_delete_session 等专用工具。"
         )
