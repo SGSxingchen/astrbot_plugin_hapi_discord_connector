@@ -384,6 +384,12 @@ class SSEListener:
                     index = req.get("index", 0)
                     if index > 0:
                         self.free_index(index)
+                    try:
+                        owner = getattr(self, "pending_mgr", None)
+                        if owner is not None:
+                            owner.clear_rui_state(sid, rid)
+                    except Exception:
+                        pass
 
                 # 为新请求分配序号
                 for rid, req in new_requests:

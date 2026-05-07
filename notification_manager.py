@@ -511,6 +511,14 @@ class NotificationManager:
             if rid is None:
                 return None
 
+            req = pending.get(rid) or {}
+            if req.get("tool") == "request_user_input":
+                from .discord_ui import RequestUserInputView
+
+                return RequestUserInputView(
+                    plugin, self._fake_event_for_umo(umo), session_id, rid
+                )
+
             from .discord_ui import ApprovalNoticeView
 
             return ApprovalNoticeView(

@@ -71,6 +71,8 @@ class LLMIntegration:
             "dhapi_coding_change_config",
             "dhapi_coding_archive_session",
             "dhapi_coding_delete_session",
+            "dhapi_coding_list_pending_questions",
+            "dhapi_coding_answer_request_user_input",
         }
 
         # 所有工具
@@ -89,6 +91,8 @@ class LLMIntegration:
             "dhapi_coding_archive_session",
             "dhapi_coding_delete_session",
             "dhapi_coding_execute_command",
+            "dhapi_coding_list_pending_questions",
+            "dhapi_coding_answer_request_user_input",
         }
 
         # 决定要移除的工具
@@ -471,10 +475,11 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         """说明 HAPI Discord Connector 的交互方式与 LLM 工具能力。"""
         return (
             "Discord 侧仅保留 /dhapi 一个入口，会打开按钮/下拉菜单/Modal 控制面板；"
-            "不再支持 /dhapi list/sw/a/deny 等文本子命令。\n"
+            "不再支持 /dhapi list/sw/a/deny 等文本子命令；Codex 交互问答可用 /dhapi answer 文本兜底。\n"
             "请在 /dhapi 面板加入/退出 session；LLM 可直接使用 "
             "dhapi_coding_list_sessions、dhapi_coding_join_session、"
-            "dhapi_coding_send_message、dhapi_coding_stop_message 等工具完成操作。"
+            "dhapi_coding_send_message、dhapi_coding_stop_message 等工具完成操作；"
+            "request_user_input 可先用 dhapi_coding_list_pending_questions 查询，代答提交入口为 TODO。"
         )
 
     # ──── 操作类工具（需要审批）────
@@ -833,6 +838,58 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             await self.plugin.state_mgr.leave_all_session_owners(sid)
             await self.plugin._refresh_sessions()
         return msg
+
+    async def tool_list_pending_questions(
+        self, event: AstrMessageEvent, session_id: str = ""
+    ) -> str:
+        """列出 Codex request_user_input 待答问题（只读）。"""
+        visible_sids = set(self.plugin.binding_mgr.get_window_sessions(event.unified_msg_origin))
+        visible_sids.add(event.unified_msg_origin)
+        if session_id:
+            sid, error = self._resolve_sid_text(event, session_id)
+            if error:
+                return error
+            if not self.validate_sid(sid):
+                return self._missing_sid_text(sid)
+            visible_sids = {sid}
+        items = [
+            (sid, rid, req)
+            for sid, rid, req in self.pending_mgr.flatten_pending(event, visible_sids)
+            if self.pending_mgr.is_request_user_input(req)
+        ]
+        if not items:
+            return "当前没有 Codex request_user_input 交互问答请求。"
+        lines = ["Codex request_user_input 待答请求："]
+        for sid, rid, req in items:
+            questions = self.pending_mgr._question_list(req)
+            lines.append(
+                f"#{req.get('index', '?')} session {sid[:8]} request {rid[:8]}：{len(questions)} 题"
+            )
+            for qi, q in enumerate(questions, 1):
+                lines.append(f"  {qi}. {q.get('question') or q.get('id') or '问题'}")
+        lines.append("TODO：LLM 直接代答入口已预留；建议优先让管理员使用 Discord 原生组件审阅提交。")
+        return "\n".join(lines)
+
+    async def tool_answer_request_user_input(
+        self,
+        event: AstrMessageEvent,
+        request_index: str,
+        question_number: int,
+        option: str,
+        note: str = "",
+        session_id: str = "",
+    ) -> str:
+        """TODO: 预留 LLM 代答 request_user_input 的工具入口。"""
+        if session_id:
+            sid, error = self._resolve_sid_text(event, session_id)
+            if error:
+                return error
+            if not self.validate_sid(sid):
+                return self._missing_sid_text(sid)
+        return (
+            "TODO：dhapi_coding_answer_request_user_input 已预留，但当前版本不允许 LLM 直接提交。"
+            "请使用 Discord 原生交互问答组件，或文本兜底 /dhapi answer <审批序号> <题号> <选项> [备注]。"
+        )
 
     async def tool_execute_command(self, event: AstrMessageEvent, command: str):
         """文本 /dhapi 子命令已废弃；请改用专用 dhapi_coding_* 工具。"""
