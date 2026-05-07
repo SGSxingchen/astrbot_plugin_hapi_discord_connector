@@ -106,11 +106,23 @@ def test_short_final_uses_message_str_without_file(tmp_path):
     trigger = make_trigger(tmp_path, agent_final_use_file_when_chars=100)
     text, meta = trigger._prepare_final_message(payload("short final"))
 
-    assert text == "short final"
+    assert "short final" in text
+    assert "【DHAPI_AGENT_FINAL】" in text
     assert meta["dhapi_final_chars"] == len("short final")
     assert meta["dhapi_final_preview_chars"] == len("short final")
     assert "dhapi_final_file" not in meta
     assert not (tmp_path / "dhapi_agent_final").exists()
+
+
+def test_short_final_with_custom_template(tmp_path):
+    trigger = make_trigger(
+        tmp_path,
+        agent_final_use_file_when_chars=100,
+        trigger_message_template="PREFIX::{content}::SUFFIX",
+    )
+    text, _ = trigger._prepare_final_message(payload("short final"))
+
+    assert text == "PREFIX::short final::SUFFIX"
 
 
 def test_long_final_writes_file_and_uses_preview(tmp_path):
