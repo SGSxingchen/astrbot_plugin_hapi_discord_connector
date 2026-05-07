@@ -29,7 +29,8 @@ def _session_title(session: dict) -> str:
     summary = (meta.get("summary") or {}).get("text", "") or "(无标题)"
     flavor = meta.get("flavor", "?")
     sid = session.get("id", "?")[:8]
-    return _clip(f"{flavor} · {summary} · {sid}", 100)
+    plan = " 📋Plan Mode" if formatters.is_plan_mode_session(session) else ""
+    return _clip(f"{flavor} · {summary}{plan} · {sid}", 100)
 
 
 def _session_desc(session: dict) -> str:
@@ -44,6 +45,10 @@ def _session_desc(session: dict) -> str:
     )
     pending = session.get("pendingRequestsCount", 0)
     extra = f" · {pending} 待审批" if pending else ""
+    flavor = str(meta.get("flavor") or "").lower()
+    if flavor == "codex":
+        extra += f" · 协作:{session.get('collaborationMode', 'default')}"
+        extra += f" · Effort:{session.get('modelReasoningEffort') or 'inherit'}"
     return _clip(f"{status}{extra} · {path}", 100)
 
 
@@ -902,11 +907,52 @@ class SessionListView(DhapiBaseView):
         )
 
 
+class SessionEffortSelect(discord.ui.Select):
+    def __init__(self, sid: str, current: str | None):
+        current_value = current or "inherit"
+        options = [
+            discord.SelectOption(
+                label="inherit（继承默认）",
+                value="inherit",
+                default=current_value == "inherit",
+            )
+        ]
+        for effort in REASONING_EFFORT_OPTIONS:
+            options.append(
+                discord.SelectOption(
+                    label=effort,
+                    value=effort,
+                    default=current_value == effort,
+                )
+            )
+        super().__init__(
+            placeholder="切换 Codex reasoning effort",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"dhapi:session:effort:{sid[:8]}",
+            row=3,
+        )
+        self.sid = sid
+
+    async def callback(self, interaction: discord.Interaction):
+        view: SessionActionView = self.view  # type: ignore[assignment]
+        effort = self.values[0]
+        ok, msg, _ = await view.plugin.set_reasoning_effort_for_session(view.sid, effort)
+        next_view = SessionActionView(view.plugin, view.event, view.sid)
+        await view.edit(
+            interaction,
+            next_view.build_embed(("✅ " if ok else "❌ ") + msg),
+            next_view,
+        )
+
+
 class SessionActionView(DhapiBaseView):
     def __init__(self, plugin, event, sid: str):
         super().__init__(plugin, event)
         self.sid = sid
         self._sync_join_button()
+        self._sync_plan_controls()
 
     def _is_joined(self) -> bool:
         return self.sid in self.plugin.binding_mgr.get_window_sessions(self.umo)
@@ -922,6 +968,25 @@ class SessionActionView(DhapiBaseView):
                     else discord.ButtonStyle.success
                 )
                 item.emoji = "➖" if joined else "✅"
+
+    def _sync_plan_controls(self):
+        session = self.session_by_id(self.sid)
+        flavor = str(((session or {}).get("metadata") or {}).get("flavor") or "").lower()
+        in_plan = formatters.is_plan_mode_session(session)
+        for item in self.children:
+            custom_id = getattr(item, "custom_id", "")
+            if custom_id == "dhapi:session:plan":
+                item.disabled = flavor not in {"claude", "codex"}
+                item.label = "关闭 Plan" if in_plan else "开启 Plan"
+                item.style = (
+                    discord.ButtonStyle.primary
+                    if in_plan
+                    else discord.ButtonStyle.secondary
+                )
+        if flavor == "codex":
+            self.add_item(
+                SessionEffortSelect(self.sid, (session or {}).get("modelReasoningEffort"))
+            )
 
     def build_embed(self, note: str = "") -> discord.Embed:
         session = self.session_by_id(self.sid)
@@ -1064,6 +1129,27 @@ class SessionActionView(DhapiBaseView):
     ):
         view = ConfirmArchiveView(self.plugin, self.event, self.sid)
         await self.edit(interaction, view.build_embed(), view)
+
+    @discord.ui.button(
+        label="开启 Plan",
+        style=discord.ButtonStyle.secondary,
+        emoji="📋",
+        custom_id="dhapi:session:plan",
+        row=2,
+    )
+    async def plan_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        ok, msg, enabled = await self.plugin.set_plan_mode_for_session(self.sid)
+        if ok and enabled is not None:
+            await self.plugin.push_plan_mode_notice(self.sid, enabled)
+        next_view = SessionActionView(self.plugin, self.event, self.sid)
+        if ok and enabled is not None:
+            action = "已开启" if enabled else "已关闭"
+            note = f"✅ 此窗口 Plan 模式{action}"
+        else:
+            note = f"❌ {msg}"
+        await self.edit(interaction, next_view.build_embed(note), next_view)
 
     @discord.ui.button(
         label="删除",

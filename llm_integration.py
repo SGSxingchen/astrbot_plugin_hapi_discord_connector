@@ -71,6 +71,8 @@ class LLMIntegration:
             "dhapi_coding_change_config",
             "dhapi_coding_archive_session",
             "dhapi_coding_delete_session",
+            "dhapi_coding_set_plan_mode",
+            "dhapi_coding_set_reasoning_effort",
         }
 
         # 所有工具
@@ -88,6 +90,8 @@ class LLMIntegration:
             "dhapi_coding_stop_message",
             "dhapi_coding_archive_session",
             "dhapi_coding_delete_session",
+            "dhapi_coding_set_plan_mode",
+            "dhapi_coding_set_reasoning_effort",
             "dhapi_coding_execute_command",
         }
 
@@ -474,7 +478,8 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             "不再支持 /dhapi list/sw/a/deny 等文本子命令。\n"
             "请在 /dhapi 面板加入/退出 session；LLM 可直接使用 "
             "dhapi_coding_list_sessions、dhapi_coding_join_session、"
-            "dhapi_coding_send_message、dhapi_coding_stop_message 等工具完成操作。"
+            "dhapi_coding_send_message、dhapi_coding_stop_message、"
+            "dhapi_coding_set_plan_mode、dhapi_coding_set_reasoning_effort 等工具完成操作。"
         )
 
     # ──── 操作类工具（需要审批）────
@@ -834,11 +839,68 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             await self.plugin._refresh_sessions()
         return msg
 
+    async def tool_set_plan_mode(
+        self, event: AstrMessageEvent, enabled: bool, session_id: str = ""
+    ):
+        """设置当前或指定 session 的 Plan Mode。"""
+        sid, error = self._resolve_sid_text(event, session_id)
+        if error:
+            return error
+        if not self.validate_sid(sid):
+            return self._missing_sid_text(sid)
+
+        approved, reason = await self._require_approval(
+            "dhapi_coding_set_plan_mode",
+            {"session_id": sid[:8], "enabled": enabled},
+            event,
+        )
+        if not approved:
+            if reason == "timeout":
+                return "操作超时：60秒内未收到用户审批。请提醒用户打开 /dhapi 审批面板处理。"
+            if reason == "notification_failed":
+                return "操作失败：无法发送审批通知到用户。请检查是否已绑定 session。"
+            return "操作已被用户拒绝，请停止工具调用，先交流清楚问题"
+
+        ok, msg, enabled_after = await self.plugin.set_plan_mode_for_session(
+            sid, enabled
+        )
+        if ok and enabled_after is not None:
+            await self.plugin.push_plan_mode_notice(sid, enabled_after)
+            action = "已开启" if enabled_after else "已关闭"
+            return f"✅ 此窗口 Plan 模式{action}"
+        return f"❌ {msg}"
+
+    async def tool_set_reasoning_effort(
+        self, event: AstrMessageEvent, effort: str, session_id: str = ""
+    ):
+        """运行中设置 Codex reasoning effort。"""
+        sid, error = self._resolve_sid_text(event, session_id)
+        if error:
+            return error
+        if not self.validate_sid(sid):
+            return self._missing_sid_text(sid)
+
+        approved, reason = await self._require_approval(
+            "dhapi_coding_set_reasoning_effort",
+            {"session_id": sid[:8], "effort": effort},
+            event,
+        )
+        if not approved:
+            if reason == "timeout":
+                return "操作超时：60秒内未收到用户审批。请提醒用户打开 /dhapi 审批面板处理。"
+            if reason == "notification_failed":
+                return "操作失败：无法发送审批通知到用户。请检查是否已绑定 session。"
+            return "操作已被用户拒绝，请停止工具调用，先交流清楚问题"
+
+        ok, msg, _ = await self.plugin.set_reasoning_effort_for_session(sid, effort)
+        return ("✅ " if ok else "❌ ") + msg
+
     async def tool_execute_command(self, event: AstrMessageEvent, command: str):
         """文本 /dhapi 子命令已废弃；请改用专用 dhapi_coding_* 工具。"""
         return (
             "文本 /dhapi 子命令已废弃。Discord 用户请使用 /dhapi 打开交互面板；"
             "LLM 请直接调用 dhapi_coding_list_sessions / dhapi_coding_join_session / "
             "dhapi_coding_send_message / dhapi_coding_stop_message / "
-            "dhapi_coding_archive_session / dhapi_coding_delete_session 等专用工具。"
+            "dhapi_coding_archive_session / dhapi_coding_delete_session / "
+            "dhapi_coding_set_plan_mode / dhapi_coding_set_reasoning_effort 等专用工具。"
         )

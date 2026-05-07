@@ -502,20 +502,30 @@ class SSEListener:
                     s.setdefault("metadata", {}).update(updated_data["metadata"])
                 if "pendingRequestsCount" in updated_data:
                     s["pendingRequestsCount"] = updated_data["pendingRequestsCount"]
+                if "permissionMode" in updated_data:
+                    s["permissionMode"] = updated_data["permissionMode"]
+                if "collaborationMode" in updated_data:
+                    s["collaborationMode"] = updated_data["collaborationMode"]
+                if "modelReasoningEffort" in updated_data:
+                    s["modelReasoningEffort"] = updated_data["modelReasoningEffort"]
                 break
         else:
             metadata = updated_data.get("metadata")
-            cache.append(
-                {
-                    "id": sid,
-                    "active": updated_data.get("active", False),
-                    "thinking": updated_data.get("thinking", False),
-                    "pendingRequestsCount": updated_data.get("pendingRequestsCount", 0),
-                    "metadata": copy.deepcopy(metadata)
-                    if isinstance(metadata, dict)
-                    else {},
-                }
-            )
+            new_session = {
+                "id": sid,
+                "active": updated_data.get("active", False),
+                "thinking": updated_data.get("thinking", False),
+                "pendingRequestsCount": updated_data.get("pendingRequestsCount", 0),
+                "metadata": copy.deepcopy(metadata) if isinstance(metadata, dict) else {},
+            }
+            for key in (
+                "permissionMode",
+                "collaborationMode",
+                "modelReasoningEffort",
+            ):
+                if key in updated_data:
+                    new_session[key] = updated_data[key]
+            cache.append(new_session)
 
     def _already_notified_messages(self, sid: str, latest_visible_seq: int) -> bool:
         return latest_visible_seq <= self._message_notified_seqs.get(sid, -1)

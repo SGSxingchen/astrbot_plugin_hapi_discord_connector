@@ -82,6 +82,38 @@ async def set_model_mode(
         return False, f"切换失败: {resp.status} {body[:200]}"
 
 
+async def set_collaboration_mode(
+    client: AsyncHapiClient, sid: str, mode: str
+) -> tuple[bool, str]:
+    """设置 Codex 协作模式。"""
+    resp = await client.post(
+        f"/api/sessions/{sid}/collaboration-mode", json={"mode": mode}
+    )
+    if resp.ok:
+        resp.release()
+        return True, f"协作模式已切换为: {mode}"
+    body = await resp.text()
+    resp.release()
+    return False, f"切换失败: {resp.status} {body[:200]}"
+
+
+async def set_codex_reasoning_effort(
+    client: AsyncHapiClient, sid: str, effort: str | None
+) -> tuple[bool, str]:
+    """运行中设置 Codex reasoning effort；None 表示继承默认设置。"""
+    resp = await client.post(
+        f"/api/sessions/{sid}/model-reasoning-effort",
+        json={"modelReasoningEffort": effort},
+    )
+    if resp.ok:
+        resp.release()
+        label = effort or "继承默认"
+        return True, f"Codex reasoning effort 已切换为: {label}"
+    body = await resp.text()
+    resp.release()
+    return False, f"切换失败: {resp.status} {body[:200]}"
+
+
 async def approve_permission(
     client: AsyncHapiClient, sid: str, rid: str, answers: dict | None = None
 ) -> tuple[bool, str]:

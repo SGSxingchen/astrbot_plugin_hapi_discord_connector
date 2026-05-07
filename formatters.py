@@ -231,7 +231,19 @@ def session_label_short(sid: str, sessions_cache: list[dict]) -> str:
     if len(path) > 40:
         path = "..." + path[-37:]
 
-    return f"💬 {title}\n📂 {path}\n🤖 {flavor} | 🏷️ {sid[:8]}"
+    plan_tag = " | 📋Plan Mode" if is_plan_mode_session(session) else ""
+    return f"💬 {title}{plan_tag}\n📂 {path}\n🤖 {flavor} | 🏷️ {sid[:8]}"
+
+
+def is_plan_mode_session(session: dict | None) -> bool:
+    """Claude permissionMode 或 Codex collaborationMode 处于 plan 即视为 Plan Mode。"""
+    if not session:
+        return False
+    meta = session.get("metadata") or {}
+    flavor = str(meta.get("flavor", "")).lower()
+    return session.get("permissionMode") == "plan" or (
+        flavor == "codex" and session.get("collaborationMode") == "plan"
+    )
 
 
 def group_sessions_by_path(sessions: list[dict]) -> dict[str, list[dict]]:
@@ -404,6 +416,8 @@ def format_session_status(s: dict) -> str:
     thinking = s.get("thinking", False)
     perm = s.get("permissionMode", "default")
     model = s.get("modelMode", "default")
+    collab = s.get("collaborationMode", "default")
+    reasoning = s.get("modelReasoningEffort") or "继承默认"
     summary = (meta.get("summary") or {}).get("text", "(无标题)")
 
     lines = [
@@ -415,7 +429,11 @@ def format_session_status(s: dict) -> str:
         f"Thinking: {thinking}",
         f"权限模式: {perm}",
         f"模型:     {model}",
+        f"Plan Mode: {'开启' if is_plan_mode_session(s) else '关闭'}",
     ]
+    if flavor == "codex":
+        lines.append(f"协作模式: {collab}")
+        lines.append(f"Reasoning: {reasoning}")
     return "\n".join(lines)
 
 
@@ -776,6 +794,8 @@ KNOWN_HAPI_SUBCOMMANDS = {
     "to",
     "perm",
     "model",
+    "plan",
+    "effort",
     "remote",
     "output",
     "out",
@@ -1020,6 +1040,20 @@ HELP_COMMANDS = [
         "usage": "/dhapi model [模式]",
         "summary": "查看或切换模型模式（仅 Claude）",
         "example": None,
+        "home": True,
+    },
+    {
+        "topic": "config",
+        "usage": "/dhapi plan [序号|ID前缀]",
+        "summary": "切换 Plan Mode。Claude 切 permissionMode，Codex 切 collaborationMode。",
+        "example": "/dhapi plan",
+        "home": True,
+    },
+    {
+        "topic": "config",
+        "usage": "/dhapi effort <值>",
+        "summary": "运行中切换 Codex reasoning effort：none/minimal/low/medium/high/xhigh",
+        "example": "/dhapi effort high",
         "home": True,
     },
     {
