@@ -1,5 +1,13 @@
 # 更新日志
 
+## v1.3.4 — LLM 工具会话作用域收紧
+
+1. LLM 工具的 session 解析限制到当前 Discord 窗口已加入的 session，阻断长期记忆里的旧完整 UUID 直通旧会话。
+2. `send/stop/archive/delete/leave/status/history` 只允许操作当前窗口 joined session；短 ID、前缀、序号也只在 joined 候选内解析。
+3. `create_session` 成功后自动加入当前窗口并刷新 session 缓存，返回文案引导后续省略 `session_id`。
+4. `join_session` 改为先刷新并解析 canonical sid 后再请求审批，降低序号/前缀误选风险。
+5. 新增 scoped session 回归测试，覆盖旧 UUID 串线、短前缀解析和非 joined 操作拒绝。
+
 ## v1.3.3 — agent final 模板回归
 
 1. 修复 `_prepare_final_message` 没有应用 `trigger_message_template` 配置的问题，注入主链的 synthetic user 消息现在会重新走用户配置的模板。
