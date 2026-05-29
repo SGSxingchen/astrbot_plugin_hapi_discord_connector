@@ -123,7 +123,7 @@ _✨ HAPI 远程 vibe coding 的 Discord 专用版 ✨_
 | `dhapi_coding_delete_session(session_id="")` | 删除 session（危险，需审批） |
 | `dhapi_coding_change_config` | 修改插件配置 |
 
-`session_id` 不传时只是便捷糖：只有当前 Discord 窗口刚好加入了 1 个 session 才会自动使用它；未加入会提示先 `dhapi_coding_join_session(session_id)`，已加入多个会返回短列表并要求下一轮显式传 `session_id`。
+`session_id` 不传时只是便捷糖：只有当前 Discord 窗口刚好加入了 1 个 session 才会自动使用它。为避免 LLM 长期记忆中的旧完整 UUID 串到旧 session，`send/status/history/stop/archive/delete/leave` 只会在**当前窗口已加入的 session** 内解析显式参数；短 ID / 前缀 / 序号也只在当前窗口 joined 列表内生效。未加入时请先 `dhapi_coding_list_sessions` + `dhapi_coding_join_session(session_id)`，或创建新 session 后省略 `session_id`。
 
 操作类工具的审批入口与文本流分离：LLM 工具发起操作时会在当前 Discord 窗口发送 **Embed + 原生按钮**，可直接点击“批准 / 拒绝 / 打开审批面板”，也可进入 `/dhapi` 审批页处理。
 

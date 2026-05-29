@@ -206,7 +206,7 @@ class HapiDiscordConnectorPlugin(Star):
 
     @filter.llm_tool(name="dhapi_coding_get_status")
     async def tool_get_status(self, event: AstrMessageEvent, session_id: str = "") -> str:
-        """获取 HAPI session 状态；session_id 可选，不传时当前窗口必须只加入一个 session。"""
+        """获取 HAPI session 状态；仅允许当前窗口已加入的 session，优先省略 session_id。"""
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_get_status(event, session_id)
@@ -242,7 +242,7 @@ class HapiDiscordConnectorPlugin(Star):
 
         Args:
             rounds(number): 查询最近几轮消息，默认 1 轮。
-            session_id(string): 可选，显式 session ID；不传时当前窗口必须只加入一个 session。
+            session_id(string): 可选；只能解析当前窗口已加入 session 的序号/短前缀/ID，优先省略。
         """
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
@@ -274,7 +274,7 @@ class HapiDiscordConnectorPlugin(Star):
 
         Args:
             message(string): 要发送给 coding agent 的消息内容。
-            session_id(string): 可选，显式 session ID；不传时当前窗口必须只加入一个 session。
+            session_id(string): 可选；只能解析当前窗口已加入 session 的序号/短前缀/ID，优先省略。
         """
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
@@ -296,7 +296,7 @@ class HapiDiscordConnectorPlugin(Star):
         """当前 Discord 窗口退出 HAPI session 订阅；需要用户审批。
 
         Args:
-            session_id(string): 可选；不传时当前窗口必须只加入一个 session。
+            session_id(string): 可选；只能解析当前窗口已加入 session 的序号/短前缀/ID。
         """
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"

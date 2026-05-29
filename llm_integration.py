@@ -37,40 +37,43 @@ class LLMIntegration:
         # 创建的无 owner session 后续可以稳定 fallback 到这个默认窗口。
         await self.state_mgr.ensure_primary_session(event)
 
-        # 2. 上下文检查：窗口无可见 session 时只保留基础工具
+        # 2. 上下文检查：窗口无可见 session 时只保留安全基础工具
         visible_sessions = self.state_mgr.visible_sessions_for_window(
             event, self.sessions_cache
         )
+        joined_sids = self.state_mgr.binding_mgr.get_window_sessions(
+            event.unified_msg_origin
+        )
         logger.debug(
-            f"[LLM工具] 可见session数: {len(visible_sessions)}, 总session数: {len(self.sessions_cache)}"
+            f"[LLM工具] 可见session数: {len(visible_sessions)}, joined数: {len(joined_sids)}, 总session数: {len(self.sessions_cache)}"
         )
         if not visible_sessions:
             self._remove_hapi_tools(request, keep_basic=True)
             logger.debug("[LLM工具] 当前窗口无可见session，已移除非基础工具")
             return
+        if not joined_sids:
+            self._remove_joined_scope_tools(request)
+            logger.debug("[LLM工具] 当前窗口未加入session，已移除需要joined范围的工具")
 
     def _remove_hapi_tools(self, request: ProviderRequest, keep_basic: bool = False):
         """移除所有 dhapi_coding 工具
 
         Args:
-            keep_basic: 是否保留基础工具（list_sessions/list_commands/execute_command/send_message）
+            keep_basic: 是否保留安全基础工具（list/join/create/config/help）
         """
         if not hasattr(request, "func_tool") or not request.func_tool:
             return
 
-        # 基础工具（始终可用）
+        # 安全基础工具：窗口还没有任何可见 session 时也允许查询/加入/创建，
+        # 但不要暴露 send/archive/delete/stop，避免 LLM 从长期记忆里拿旧 UUID 直通。
         basic_tools = {
             "dhapi_coding_list_sessions",
             "dhapi_coding_list_commands",
             "dhapi_coding_execute_command",
-            "dhapi_coding_send_message",
             "dhapi_coding_join_session",
-            "dhapi_coding_leave_session",
             "dhapi_coding_create_session",
             "dhapi_coding_get_config_status",
             "dhapi_coding_change_config",
-            "dhapi_coding_archive_session",
-            "dhapi_coding_delete_session",
         }
 
         # 所有工具
@@ -95,6 +98,22 @@ class LLMIntegration:
         tools_to_remove = all_tools - basic_tools if keep_basic else all_tools
 
         for tool_name in tools_to_remove:
+            request.func_tool.remove_tool(tool_name)
+
+    def _remove_joined_scope_tools(self, request: ProviderRequest):
+        """移除所有必须以当前窗口 joined session 为作用域的工具。"""
+        if not hasattr(request, "func_tool") or not request.func_tool:
+            return
+        joined_scope_tools = {
+            "dhapi_coding_get_status",
+            "dhapi_coding_message_history",
+            "dhapi_coding_send_message",
+            "dhapi_coding_leave_session",
+            "dhapi_coding_stop_message",
+            "dhapi_coding_archive_session",
+            "dhapi_coding_delete_session",
+        }
+        for tool_name in joined_scope_tools:
             request.func_tool.remove_tool(tool_name)
 
     # ──── 审批机制 ────
@@ -222,36 +241,107 @@ class LLMIntegration:
             logger.warning(f"LLM 工具 {tool_name} 审批被取消")
             return False, "cancelled"
 
+    def _joined_session_candidates(
+        self, event: AstrMessageEvent
+    ) -> list[tuple[str, dict | None]]:
+        """当前 Discord 窗口已 joined 的 session，按 join 顺序返回。
+
+        注意：这是 LLM 操作工具的唯一解析作用域。显式完整 UUID、短前缀、
+        列表序号都只能在这个候选集合内解析，禁止从全局 sessions_cache 或
+        长期记忆补全到未 joined 的旧 session。
+        """
+        joined = self.state_mgr.binding_mgr.get_window_sessions(event.unified_msg_origin)
+        by_sid = {
+            session.get("id"): session
+            for session in self.sessions_cache
+            if session.get("id")
+        }
+        return [(sid, by_sid.get(sid)) for sid in joined if sid]
+
+    @staticmethod
+    def _session_title_for_display(session: dict | None) -> str:
+        if not session:
+            return "(缓存中暂未找到 session 详情)"
+        meta = session.get("metadata") or {}
+        summary_data = meta.get("summary") or {}
+        summary = (
+            summary_data.get("text", "")
+            if isinstance(summary_data, dict)
+            else str(summary_data)
+        ) or "(无标题)"
+        flavor = meta.get("flavor", "?")
+        path = meta.get("path", "")
+        suffix = f" · {path}" if path else ""
+        return f"[{flavor}] {summary}{suffix}"
+
     def _joined_session_lines(self, event: AstrMessageEvent) -> list[str]:
         """格式化当前窗口已加入 session 的短列表。"""
-        joined = self.state_mgr.binding_mgr.get_window_sessions(event.unified_msg_origin)
         lines: list[str] = []
-        for idx, sid in enumerate(joined, 1):
-            session = next((s for s in self.sessions_cache if s.get("id") == sid), None)
-            title = "(未知 session)"
-            if session:
-                meta = session.get("metadata") or {}
-                summary = (meta.get("summary") or {}).get("text", "") or "(无标题)"
-                flavor = meta.get("flavor", "?")
-                title = f"[{flavor}] {summary}"
+        for idx, (sid, session) in enumerate(self._joined_session_candidates(event), 1):
+            title = self._session_title_for_display(session)
             lines.append(f"{idx}. {sid[:8]} - {title}")
         return lines
+
+    def _resolve_joined_sid_text(
+        self, event: AstrMessageEvent, session_id: str | None
+    ) -> tuple[str | None, str | None]:
+        """在当前窗口 joined 范围内解析工具目标 session。
+
+        这是 send/stop/archive/delete/leave/status/history 的安全入口：
+        - 空 session_id：仅当当前窗口恰好 joined 一个 session 时自动选择；
+        - 数字：按当前窗口 joined 列表序号解析；
+        - 短 ID / 前缀 / 完整 UUID：只在当前窗口 joined 候选里唯一匹配时解析；
+        - 不允许从全局 sessions_cache 或 LLM 长期记忆里的旧完整 UUID 补全。
+        """
+        candidates = self._joined_session_candidates(event)
+        explicit = str(session_id or "").strip()
+
+        if not candidates:
+            return None, self._missing_session_text()
+
+        if not explicit:
+            if len(candidates) == 1:
+                return candidates[0][0], None
+            lines = self._joined_session_lines(event)
+            return (
+                None,
+                "当前窗口已加入多个 session。为避免串线，请在下一轮工具调用里"
+                "只使用下方当前窗口 joined 列表中的序号或短前缀，"
+                "不要使用长期记忆里的旧完整 UUID：\n"
+                + "\n".join(lines[:10]),
+            )
+
+        if explicit.isdigit():
+            idx = int(explicit)
+            if 1 <= idx <= len(candidates):
+                return candidates[idx - 1][0], None
+
+        matches = [sid for sid, _ in candidates if sid.startswith(explicit)]
+        if len(matches) == 1:
+            return matches[0], None
+        if len(matches) > 1:
+            return (
+                None,
+                f"当前窗口 joined session 中有 {len(matches)} 个匹配 `{explicit[:12]}`，"
+                "请提供更长的当前窗口短前缀或使用 joined 列表序号。",
+            )
+
+        return (
+            None,
+            f"拒绝操作：目标 session `{explicit[:12]}` 未加入当前 Discord 窗口。"
+            "为防止长期记忆旧 UUID 串到旧 session，LLM 工具只能操作当前窗口已 joined 的 session。"
+            "请先使用 dhapi_coding_list_sessions 与 dhapi_coding_join_session 加入目标，"
+            "或创建新 session 后省略 session_id。",
+        )
 
     def _resolve_sid_text(
         self, event: AstrMessageEvent, session_id: str | None
     ) -> tuple[str | None, str | None]:
-        """解析工具目标 session；失败时返回 LLM 可读提示。"""
-        sid, reason = self.state_mgr.resolve_target_sid(event, session_id)
-        if sid:
-            return sid, None
-        if reason == "ambiguous":
-            lines = self._joined_session_lines(event)
-            return (
-                None,
-                "当前窗口已加入多个 session，请在下一轮工具调用里显式传 session_id：\n"
-                + "\n".join(lines[:10]),
-            )
-        return None, self._missing_session_text()
+        """解析工具目标 session；失败时返回 LLM 可读提示。
+
+        保留旧函数名供各工具调用，但语义已收紧为当前窗口 joined scope。
+        """
+        return self._resolve_joined_sid_text(event, session_id)
 
     def validate_sid(self, sid: str) -> bool:
         """检查 sid 是否存在于当前 sessions_cache。"""
@@ -265,8 +355,9 @@ class LLMIntegration:
     @staticmethod
     def _missing_session_text() -> str:
         return (
-            "当前窗口未加入任何 session，请先用 dhapi_coding_join_session(session_id) 加入，"
-            "或在参数里直接传 session_id。"
+            "当前窗口未加入任何 session。请先用 dhapi_coding_list_sessions 查看可加入的 session，"
+            "再用 dhapi_coding_join_session(session_id) 加入目标；也可以使用 "
+            "dhapi_coding_create_session 创建新 session。为防止旧 UUID 串线，不要直接使用长期记忆里的 session_id。"
         )
 
     @staticmethod
@@ -531,15 +622,71 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             return None, f"匹配到 {len(matches)} 个 session，请提供更长的 ID 前缀。"
         return None, f"未找到匹配的 session: {value}"
 
+    @staticmethod
+    def _session_approval_payload(session: dict) -> dict:
+        """给用户审批看的 canonical join 目标，避免序号/前缀落点不透明。"""
+        sid = session.get("id", "")
+        meta = session.get("metadata") or {}
+        summary_data = meta.get("summary") or {}
+        summary = (
+            summary_data.get("text", "")
+            if isinstance(summary_data, dict)
+            else str(summary_data)
+        ) or "(无标题)"
+        payload = {
+            "session_id": sid,
+            "short_id": sid[:8],
+            "agent": meta.get("flavor", "?"),
+            "summary": summary,
+        }
+        path = meta.get("path")
+        if path:
+            payload["path"] = path
+        return payload
+
+    def _ensure_session_cached(
+        self,
+        sid: str,
+        *,
+        agent: str = "unknown",
+        directory: str = "",
+        summary: str = "新建 session",
+    ):
+        """refresh 后仍缺新 session 时登记最小元数据，避免刚创建就 validate 失败。"""
+        if not sid or any(s.get("id") == sid for s in self.sessions_cache):
+            return
+        self.sessions_cache.append(
+            {
+                "id": sid,
+                "active": True,
+                "thinking": False,
+                "pendingRequestsCount": 0,
+                "metadata": {
+                    "flavor": agent or "unknown",
+                    "path": directory or "",
+                    "summary": {"text": summary},
+                },
+            }
+        )
+
     async def tool_join_session(self, event: AstrMessageEvent, session_id: str):
         """把指定 session 加入当前 Discord 窗口订阅。
 
         Args:
             session_id(string): session ID / ID 前缀 / session 列表序号
         """
-        # 请求审批
+        await self.plugin._refresh_sessions()
+        chosen, error = self._find_session_by_id_or_prefix(session_id)
+        if error:
+            return error
+
+        sid = chosen["id"]
+        if not self.validate_sid(sid):
+            return self._missing_sid_text(sid)
+
+        # 先解析到 canonical sid，再请求审批，避免用户不知道序号/前缀最终落到谁。
         approved, reason = await self._require_approval(
-            "dhapi_coding_join_session", {"session_id": session_id}, event
+            "dhapi_coding_join_session", self._session_approval_payload(chosen), event
         )
         if not approved:
             if reason == "timeout":
@@ -550,14 +697,6 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
                 return "操作已被用户拒绝，请停止工具调用，先交流清楚问题"
             return
 
-        await self.plugin._refresh_sessions()
-        chosen, error = self._find_session_by_id_or_prefix(session_id)
-        if error:
-            return error
-
-        sid = chosen["id"]
-        if not self.validate_sid(sid):
-            return self._missing_sid_text(sid)
         flavor = (chosen.get("metadata") or {}).get("flavor", "claude")
         await self.state_mgr.join_session(sid, event.unified_msg_origin, flavor)
         await self.state_mgr.set_user_state(event)
@@ -567,16 +706,17 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             event.unified_msg_origin,
             flavor,
         )
-        return f"已在当前 Discord 窗口加入 [{flavor}] {sid[:8]}"
+        return (
+            f"已在当前 Discord 窗口加入 [{flavor}] {sid[:8]}。"
+            "后续 send/status/history/stop/archive/delete/leave 等工具请优先省略 session_id；"
+            "如当前窗口加入多个 session，只能使用当前窗口 joined 列表里的序号或短前缀。"
+        )
 
     async def tool_leave_session(self, event: AstrMessageEvent, session_id: str = ""):
         """当前 Discord 窗口退出指定 session 订阅。"""
         sid, error = self._resolve_sid_text(event, session_id)
         if error:
             return error
-        if not self.validate_sid(sid):
-            return self._missing_sid_text(sid)
-
         approved, reason = await self._require_approval(
             "dhapi_coding_leave_session", {"session_id": sid[:8]}, event
         )
@@ -695,13 +835,31 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         if ok and sid:
             await self.state_mgr.join_session(sid, event.unified_msg_origin, agent)
             await self.state_mgr.set_user_state(event)
+            refresh_note = ""
+            try:
+                await self.plugin._refresh_sessions()
+            except Exception as e:
+                refresh_note = "（刷新 session 缓存失败，已临时登记新 session）"
+                logger.warning(
+                    "[dhapi] LLM create refresh sessions failed sid=%s: %s",
+                    sid[:8],
+                    e,
+                )
+            self._ensure_session_cached(
+                sid, agent=agent, directory=directory, summary="新建 session"
+            )
             logger.info(
                 "[dhapi] LLM create joined sid=%s umo=%s flavor=%s",
                 sid[:8],
                 event.unified_msg_origin,
                 agent,
             )
-            return f"✅ 已创建 session: {sid[:8]}"
+            return (
+                f"✅ 已创建并加入当前 Discord 窗口：{sid[:8]}。{refresh_note}\n"
+                "后续 dhapi_coding_send_message / get_status / message_history / stop 等工具"
+                "请省略 session_id，让插件使用当前窗口 joined session；"
+                "不要使用长期记忆里的旧完整 UUID。"
+            )
         else:
             return f"创建失败: {msg}"
 
