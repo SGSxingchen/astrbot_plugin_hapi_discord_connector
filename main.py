@@ -86,7 +86,7 @@ async def _cancel_stale_sse_tasks():
     "astrbot_plugin_hapi_discord_connector",
     "SGSxingchen",
     "HAPI 远程 coding 的 Discord 专用版：/dhapi 原生交互与 session 管理",
-    "1.0.0",
+    "1.3.5",
 )
 class HapiDiscordConnectorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -161,9 +161,15 @@ class HapiDiscordConnectorPlugin(Star):
 
     @staticmethod
     def _is_discord_event(event: AstrMessageEvent) -> bool:
-        """仅允许 Discord 平台事件触发本插件逻辑，非 Discord 静默忽略。"""
+        """仅允许 Discord 平台事件触发本插件逻辑。
+
+        AstrBot 新版本/多实例场景下 get_platform_name() 可能返回
+        类似 "绫玖-DC(discord)" 的展示名；旧逻辑只接受严格等于
+        "discord"，会导致 Discord 窗口内 LLM 工具误判不可用。
+        """
         try:
-            return event.get_platform_name() == "discord"
+            name = str(event.get_platform_name() or "").strip().lower()
+            return name == "discord" or "(discord)" in name or name.endswith(":discord")
         except Exception:
             return False
 
