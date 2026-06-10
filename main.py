@@ -86,7 +86,7 @@ async def _cancel_stale_sse_tasks():
     "astrbot_plugin_hapi_discord_connector",
     "SGSxingchen",
     "HAPI 远程 coding 的 Discord 专用版：/dhapi 原生交互与 session 管理",
-    "1.3.5",
+    "1.3.6",
 )
 class HapiDiscordConnectorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -160,6 +160,14 @@ class HapiDiscordConnectorPlugin(Star):
         return str(event.get_sender_id()) in admin_ids
 
     @staticmethod
+    def _unwrap_tool_event(event):
+        """LLM tool may receive ContextWrapper[AstrAgentContext] instead of AstrMessageEvent."""
+        try:
+            return event.context.event
+        except Exception:
+            return event
+
+    @staticmethod
     def _is_discord_event(event: AstrMessageEvent) -> bool:
         """仅允许 Discord 平台事件触发本插件逻辑。
 
@@ -213,6 +221,7 @@ class HapiDiscordConnectorPlugin(Star):
     @filter.llm_tool(name="dhapi_coding_get_status")
     async def tool_get_status(self, event: AstrMessageEvent, session_id: str = "") -> str:
         """获取 HAPI session 状态；仅允许当前窗口已加入的 session，优先省略 session_id。"""
+        event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_get_status(event, session_id)
@@ -234,6 +243,7 @@ class HapiDiscordConnectorPlugin(Star):
             agent(string): 按代理类型过滤，claude/codex/gemini/opencode。
             joined_only(boolean): 为 true 时仅返回当前 Discord 窗口已加入的 session。
         """
+        event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_list_sessions(
@@ -250,6 +260,7 @@ class HapiDiscordConnectorPlugin(Star):
             rounds(number): 查询最近几轮消息，默认 1 轮。
             session_id(string): 可选；只能解析当前窗口已加入 session 的序号/短前缀/ID，优先省略。
         """
+        event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_message_history(event, rounds, session_id)
@@ -257,6 +268,7 @@ class HapiDiscordConnectorPlugin(Star):
     @filter.llm_tool(name="dhapi_coding_get_config_status")
     async def tool_get_config_status(self, event: AstrMessageEvent) -> str:
         """获取 HAPI Discord Connector 当前配置状态和可修改项说明。"""
+        event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_get_config_status(event)
@@ -268,6 +280,7 @@ class HapiDiscordConnectorPlugin(Star):
         Args:
             topic(string): 帮助专题，可选：会话/对话/审批/通知/文件/配置/全部；留空显示常用帮助。
         """
+        event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_list_commands(event, topic)
@@ -282,6 +295,7 @@ class HapiDiscordConnectorPlugin(Star):
             message(string): 要发送给 coding agent 的消息内容。
             session_id(string): 可选；只能解析当前窗口已加入 session 的序号/短前缀/ID，优先省略。
         """
+        event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_send_message(event, message, session_id)
@@ -293,6 +307,7 @@ class HapiDiscordConnectorPlugin(Star):
         Args:
             session_id(string): session 序号如 1，或 session ID/前缀如 abc12345。
         """
+        event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_join_session(event, session_id)
@@ -304,6 +319,7 @@ class HapiDiscordConnectorPlugin(Star):
         Args:
             session_id(string): 可选；只能解析当前窗口已加入 session 的序号/短前缀/ID。
         """
+        event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_leave_session(event, session_id)
@@ -329,6 +345,7 @@ class HapiDiscordConnectorPlugin(Star):
             yolo(boolean): 是否自动批准该 session 内所有权限，默认 false。
             model_reasoning_effort(string): 仅 Codex 可选；留空继承默认，可选 none/minimal/low/medium/high/xhigh。
         """
+        event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_create_session(
@@ -351,6 +368,7 @@ class HapiDiscordConnectorPlugin(Star):
             config_name(string): 配置项名称。
             value(string): 新值。
         """
+        event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_change_config(event, config_name, value)
@@ -358,6 +376,7 @@ class HapiDiscordConnectorPlugin(Star):
     @filter.llm_tool(name="dhapi_coding_stop_message")
     async def tool_stop_message(self, event: AstrMessageEvent, session_id: str = "") -> str:
         """停止 HAPI session 的消息生成；需要用户审批。"""
+        event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_stop_message(event, session_id)
@@ -365,6 +384,7 @@ class HapiDiscordConnectorPlugin(Star):
     @filter.llm_tool(name="dhapi_coding_archive_session")
     async def tool_archive_session(self, event: AstrMessageEvent, session_id: str = "") -> str:
         """归档 HAPI session；危险操作，需要用户审批。"""
+        event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_archive_session(event, session_id)
@@ -372,6 +392,7 @@ class HapiDiscordConnectorPlugin(Star):
     @filter.llm_tool(name="dhapi_coding_delete_session")
     async def tool_delete_session(self, event: AstrMessageEvent, session_id: str = "") -> str:
         """删除 HAPI session；危险操作，需要用户审批。"""
+        event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_delete_session(event, session_id)
@@ -383,6 +404,7 @@ class HapiDiscordConnectorPlugin(Star):
         Args:
             command(string): 已废弃的文本命令内容。
         """
+        event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
             return "dhapi 工具仅支持 Discord 平台。"
         return await self.llm_integration.tool_execute_command(event, command)
