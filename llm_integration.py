@@ -74,6 +74,8 @@ class LLMIntegration:
             "dhapi_coding_create_session",
             "dhapi_coding_get_config_status",
             "dhapi_coding_change_config",
+            # 始终暴露发送工具；具体能否发送由 tool_send_message 内部按 joined session 校验。
+            "dhapi_coding_send_message",
         }
 
         # 所有工具
@@ -107,7 +109,6 @@ class LLMIntegration:
         joined_scope_tools = {
             "dhapi_coding_get_status",
             "dhapi_coding_message_history",
-            "dhapi_coding_send_message",
             "dhapi_coding_leave_session",
             "dhapi_coding_stop_message",
             "dhapi_coding_archive_session",

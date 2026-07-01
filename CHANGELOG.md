@@ -1,5 +1,10 @@
 # 更新日志
 
+## v1.3.8 — LLM 发送工具始终暴露
+
+- 调整 `dhapi_coding_send_message` 的可见性策略：即使当前窗口尚未加入 session，也保留工具 schema。
+- 发送阶段继续沿用当前窗口 joined session 校验，避免旧 UUID 串线；未加入时返回明确提示。
+
 ## v1.3.4 — LLM 工具会话作用域收紧
 
 1. LLM 工具的 session 解析限制到当前 Discord 窗口已加入的 session，阻断长期记忆里的旧完整 UUID 直通旧会话。
