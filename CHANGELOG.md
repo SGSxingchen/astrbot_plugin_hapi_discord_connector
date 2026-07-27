@@ -1,5 +1,11 @@
 # 更新日志
 
+## v1.3.10 — Discord 会话控制与审批结果优化
+
+1. Session 卡片新增“重新打开”，可通过 HAPI `reopen` 恢复 inactive session；恢复出新 session 时自动把当前 Discord 窗口切换到新 session 的通知订阅。
+2. Session 卡片新增“会话设置”：Codex session 可切换 Fast/Standard，并可在运行中修改推理强度，支持 `max`。
+3. 单项批准或拒绝后显示独立的结果卡，保留本次请求的工具、Session、Request ID 与参数；通知卡上的直接批准/拒绝也使用相同结果卡。
+
 ## v1.3.9 — 跟进 HAPI 上游协议与 Discord 展示适配
 
 1. 适配 HAPI 0.24+ 的 Codex 子代理内部事件：`agent-run-trace` 和 `agent-run-update` 不再被渲染成 Discord 中的 `[Message]` 占位文本，正常回复、工具调用、审批和完成通知不受影响。

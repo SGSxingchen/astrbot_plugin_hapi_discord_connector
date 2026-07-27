@@ -136,7 +136,15 @@ class DhapiBaseView(discord.ui.View):
 
 AGENT_OPTIONS = ("claude", "codex", "gemini", "opencode")
 SESSION_TYPE_OPTIONS = ("simple", "worktree")
-REASONING_EFFORT_OPTIONS = ("none", "minimal", "low", "medium", "high", "xhigh")
+REASONING_EFFORT_OPTIONS = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
 
 
 def _machine_id(machine: dict) -> str:
@@ -913,8 +921,13 @@ class SessionActionView(DhapiBaseView):
 
     def _sync_join_button(self):
         joined = self._is_joined()
+        session = self.session_by_id(self.sid) or {}
+        flavor = str(
+            ((session.get("metadata") or {}).get("flavor") or "")
+        ).lower()
         for item in self.children:
-            if getattr(item, "custom_id", "") == "dhapi:session:join_leave":
+            custom_id = getattr(item, "custom_id", "")
+            if custom_id == "dhapi:session:join_leave":
                 item.label = "从此窗口退出" if joined else "在此窗口加入"
                 item.style = (
                     discord.ButtonStyle.secondary
@@ -922,6 +935,10 @@ class SessionActionView(DhapiBaseView):
                     else discord.ButtonStyle.success
                 )
                 item.emoji = "➖" if joined else "✅"
+            elif custom_id == "dhapi:session:reopen":
+                item.disabled = bool(session.get("active"))
+            elif custom_id == "dhapi:session:config":
+                item.disabled = flavor != "codex"
 
     def build_embed(self, note: str = "") -> discord.Embed:
         session = self.session_by_id(self.sid)
@@ -1066,6 +1083,55 @@ class SessionActionView(DhapiBaseView):
         await self.edit(interaction, view.build_embed(), view)
 
     @discord.ui.button(
+        label="会话设置",
+        style=discord.ButtonStyle.secondary,
+        emoji="⚙️",
+        custom_id="dhapi:session:config",
+        row=1,
+    )
+    async def config_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        view = SessionConfigView(self.plugin, self.event, self.sid)
+        await self.edit(interaction, view.build_embed(), view)
+
+    @discord.ui.button(
+        label="重新打开",
+        style=discord.ButtonStyle.secondary,
+        emoji="♻️",
+        custom_id="dhapi:session:reopen",
+        row=2,
+    )
+    async def reopen_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        session = self.session_by_id(self.sid)
+        if session and session.get("active"):
+            await self.edit(
+                interaction,
+                self.build_embed("当前 session 仍在运行，无需重新打开。"),
+                self,
+            )
+            return
+        ok, msg, reopened_sid = await session_ops.reopen_session(
+            self.plugin.client, self.sid
+        )
+        if not ok:
+            await self.edit(interaction, self.build_embed(f"❌ {msg}"), self)
+            return
+
+        await self.refresh_sessions()
+        target_sid = reopened_sid or self.sid
+        reopened = self.session_by_id(target_sid)
+        flavor = ((reopened or {}).get("metadata") or {}).get("flavor") or "codex"
+        if target_sid != self.sid:
+            await self.plugin.state_mgr.leave_session(self.sid, self.umo)
+        await self.plugin.state_mgr.join_session(target_sid, self.umo, flavor)
+        await self.plugin.state_mgr.set_user_state(self.event)
+        view = SessionActionView(self.plugin, self.event, target_sid)
+        await self.edit(interaction, view.build_embed(f"✅ {msg}"), view)
+
+    @discord.ui.button(
         label="删除",
         style=discord.ButtonStyle.danger,
         emoji="🗑️",
@@ -1089,6 +1155,119 @@ class SessionActionView(DhapiBaseView):
         self, button: discord.ui.Button, interaction: discord.Interaction
     ):
         view = SessionListView(self.plugin, self.event)
+        await self.edit(interaction, view.build_embed(), view)
+
+
+class SessionConfigReasoningSelect(discord.ui.Select):
+    def __init__(self, selected: str | None, disabled: bool):
+        options = [
+            discord.SelectOption(
+                label="继承 Codex 默认设置",
+                value="__default__",
+                default=selected is None,
+            )
+        ]
+        options.extend(
+            discord.SelectOption(label=value, value=value, default=value == selected)
+            for value in REASONING_EFFORT_OPTIONS
+        )
+        super().__init__(
+            placeholder="调整 Codex 推理强度",
+            min_values=1,
+            max_values=1,
+            options=options,
+            disabled=disabled,
+            custom_id="dhapi:session:reasoning",
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: SessionConfigView = self.view  # type: ignore[assignment]
+        effort = None if self.values[0] == "__default__" else self.values[0]
+        ok, msg = await session_ops.set_codex_reasoning_effort(
+            view.plugin.client, view.sid, effort
+        )
+        if ok:
+            session = view.session_by_id(view.sid)
+            if session is not None:
+                session["modelReasoningEffort"] = effort
+        refreshed = SessionConfigView(view.plugin, view.event, view.sid)
+        await view.edit(
+            interaction,
+            refreshed.build_embed(("✅ " if ok else "❌ ") + msg),
+            refreshed,
+        )
+
+
+class SessionConfigView(DhapiBaseView):
+    def __init__(self, plugin, event, sid: str):
+        super().__init__(plugin, event)
+        self.sid = sid
+        session = self.session_by_id(sid) or {}
+        flavor = str(((session.get("metadata") or {}).get("flavor") or "")).lower()
+        self._is_codex = flavor == "codex"
+        self.add_item(
+            SessionConfigReasoningSelect(
+                session.get("modelReasoningEffort"), not self._is_codex
+            )
+        )
+        for item in self.children:
+            if getattr(item, "custom_id", "") == "dhapi:session:fast":
+                item.disabled = not self._is_codex
+
+    def build_embed(self, note: str = "") -> discord.Embed:
+        session = self.session_by_id(self.sid)
+        if not session:
+            return make_embed("会话设置", f"未找到 session：`{self.sid[:8]}`", ERR)
+        meta = session.get("metadata") or {}
+        flavor = meta.get("flavor") or "?"
+        tier = session.get("serviceTier") or "standard"
+        effort = session.get("modelReasoningEffort") or "继承默认"
+        lines = [
+            f"Session：`{self.sid}`",
+            f"Agent：`{flavor}`",
+            f"Fast：`{tier}`",
+            f"推理强度：`{effort}`",
+        ]
+        if not self._is_codex:
+            lines.append("\n当前仅 Codex session 支持 Fast 和推理强度调整。")
+        if note:
+            lines.append(f"\n{note}")
+        return make_embed("会话设置", "\n".join(lines), BRAND)
+
+    @discord.ui.button(
+        label="Fast：切换",
+        style=discord.ButtonStyle.primary,
+        emoji="⚡",
+        custom_id="dhapi:session:fast",
+        row=1,
+    )
+    async def fast_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        session = self.session_by_id(self.sid) or {}
+        target = "standard" if session.get("serviceTier") == "fast" else "fast"
+        ok, msg = await session_ops.set_service_tier(
+            self.plugin.client, self.sid, target
+        )
+        if ok:
+            session["serviceTier"] = target
+        view = SessionConfigView(self.plugin, self.event, self.sid)
+        await self.edit(
+            interaction, view.build_embed(("✅ " if ok else "❌ ") + msg), view
+        )
+
+    @discord.ui.button(
+        label="返回会话",
+        style=discord.ButtonStyle.secondary,
+        emoji="↩️",
+        custom_id="dhapi:session:config_back",
+        row=1,
+    )
+    async def back_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        view = SessionActionView(self.plugin, self.event, self.sid)
         await self.edit(interaction, view.build_embed(), view)
 
 
@@ -1383,10 +1562,10 @@ class ApprovalView(DhapiBaseView):
             await self.edit(interaction, self.build_embed("没有可批准的请求。"), self)
             return
         ok, msg = await self._approve_item(*item)
-        view = ApprovalView(self.plugin, self.event)
+        view = ApprovalResultView(self.plugin, self.event, item, "批准", ok, msg)
         await self.edit(
             interaction,
-            view.build_embed(("✅ 已批准：" if ok else "❌ 批准失败：") + msg),
+            view.build_embed(),
             view,
         )
 
@@ -1405,10 +1584,10 @@ class ApprovalView(DhapiBaseView):
             await self.edit(interaction, self.build_embed("没有可拒绝的请求。"), self)
             return
         ok, msg = await self._deny_item(*item)
-        view = ApprovalView(self.plugin, self.event)
+        view = ApprovalResultView(self.plugin, self.event, item, "拒绝", ok, msg)
         await self.edit(
             interaction,
-            view.build_embed(("✅ 已拒绝：" if ok else "❌ 拒绝失败：") + msg),
+            view.build_embed(),
             view,
         )
 
@@ -1476,6 +1655,55 @@ class ApprovalView(DhapiBaseView):
         )
 
 
+class ApprovalResultView(DhapiBaseView):
+    """展示单个审批操作的结果，并保留删除前的请求快照。"""
+
+    def __init__(
+        self,
+        plugin,
+        event,
+        item: tuple[str, str, dict],
+        action: str,
+        ok: bool,
+        message: str,
+    ):
+        super().__init__(plugin, event)
+        self.item = item
+        self.action = action
+        self.ok = ok
+        self.message = message
+
+    def build_embed(self) -> discord.Embed:
+        sid, rid, req = self.item
+        tool = req.get("tool") or req.get("type") or "request"
+        args = req.get("arguments") or {}
+        remaining = len(self.visible_pending_items())
+        result = f"✅ 已{self.action}" if self.ok else f"❌ {self.action}失败"
+        lines = [
+            f"{result}：{self.message}",
+            "",
+            "本次处理的请求：",
+            f"工具：`{tool}`",
+            f"Session：`{sid}`",
+            f"Request ID：`{rid}`",
+            f"参数：```text\n{_clip(args, 1200)}\n```",
+            f"剩余待审批：`{remaining}`",
+        ]
+        return make_embed("审批结果", "\n".join(lines), OK if self.ok else ERR)
+
+    @discord.ui.button(
+        label="返回审批",
+        style=discord.ButtonStyle.secondary,
+        emoji="↩️",
+        custom_id="dhapi:approval:result_back",
+    )
+    async def back_button(
+        self, button: discord.ui.Button, interaction: discord.Interaction
+    ):
+        view = ApprovalView(self.plugin, self.event)
+        await self.edit(interaction, view.build_embed(), view)
+
+
 class ApprovalNoticeView(DhapiBaseView):
     """Lightweight approval buttons attached to a single approval notification."""
 
@@ -1495,18 +1723,6 @@ class ApprovalNoticeView(DhapiBaseView):
         view = ApprovalView(self.plugin, self.event)
         await self.edit(interaction, view.build_embed(note), view)
 
-    async def _approve_current(self) -> tuple[bool, str]:
-        item = self._current_item()
-        if not item:
-            return False, "请求已处理或不存在。"
-        return await ApprovalView._approve_item(self, *item)
-
-    async def _deny_current(self) -> tuple[bool, str]:
-        item = self._current_item()
-        if not item:
-            return False, "请求已处理或不存在。"
-        return await ApprovalView._deny_item(self, *item)
-
     @discord.ui.button(
         label="批准",
         style=discord.ButtonStyle.success,
@@ -1516,10 +1732,13 @@ class ApprovalNoticeView(DhapiBaseView):
     async def approve_button(
         self, button: discord.ui.Button, interaction: discord.Interaction
     ):
-        ok, msg = await self._approve_current()
-        await self._edit_panel(
-            interaction, ("✅ 已批准：" if ok else "❌ 批准失败：") + msg
-        )
+        item = self._current_item()
+        if not item:
+            await self._edit_panel(interaction, "请求已处理或不存在。")
+            return
+        ok, msg = await ApprovalView._approve_item(self, *item)
+        view = ApprovalResultView(self.plugin, self.event, item, "批准", ok, msg)
+        await self.edit(interaction, view.build_embed(), view)
 
     @discord.ui.button(
         label="拒绝",
@@ -1530,10 +1749,13 @@ class ApprovalNoticeView(DhapiBaseView):
     async def deny_button(
         self, button: discord.ui.Button, interaction: discord.Interaction
     ):
-        ok, msg = await self._deny_current()
-        await self._edit_panel(
-            interaction, ("✅ 已拒绝：" if ok else "❌ 拒绝失败：") + msg
-        )
+        item = self._current_item()
+        if not item:
+            await self._edit_panel(interaction, "请求已处理或不存在。")
+            return
+        ok, msg = await ApprovalView._deny_item(self, *item)
+        view = ApprovalResultView(self.plugin, self.event, item, "拒绝", ok, msg)
+        await self.edit(interaction, view.build_embed(), view)
 
     @discord.ui.button(
         label="打开/刷新审批面板",

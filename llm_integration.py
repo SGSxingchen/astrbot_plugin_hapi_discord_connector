@@ -751,7 +751,7 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             machine_id(string): 机器 ID（可选，管理多机器时必填）
             session_type(string): session 类型（simple/worktree，默认 simple）
             yolo(boolean): 是否自动批准所有权限（默认 false）
-            model_reasoning_effort(string): 仅 Codex 可选；留空表示继承 Codex 默认设置，可选 none/minimal/low/medium/high/xhigh
+            model_reasoning_effort(string): 仅 Codex 可选；留空表示继承 Codex 默认设置，可选 none/minimal/low/medium/high/xhigh/max
         """
         # 获取机器列表
         try:
@@ -794,7 +794,7 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             if normalized_effort in inherit_aliases:
                 normalized_effort = ""
             elif normalized_effort not in CODEX_REASONING_EFFORT_VALUES:
-                return "Codex 的 model_reasoning_effort 只能是留空(继承默认配置)或 none/minimal/low/medium/high/xhigh"
+                return "Codex 的 model_reasoning_effort 只能是留空(继承默认配置)或 none/minimal/low/medium/high/xhigh/max"
                 return
         elif normalized_effort:
             return "只有 Codex 支持 model_reasoning_effort；其他代理请留空"

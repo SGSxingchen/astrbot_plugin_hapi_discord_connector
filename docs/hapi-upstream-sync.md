@@ -9,6 +9,8 @@
 - 对齐 Discord 专用上游 v1.3.8：未加入 session 时仍可向模型提供发送消息工具的定义，执行阶段继续校验当前 Discord 窗口的订阅范围。
 - 兼容 HAPI 0.24+ 的 Codex 子代理内部事件：`agent-run-trace`、`agent-run-update` 被识别为内部进度，不再发送成无意义的频道消息。
 - 保留 SSE 低频自动恢复：达到重连上限后仍会自动尝试重连，恢复后主动通知。
+- 将新版 HAPI 会话能力适配到 Discord 卡片：inactive session 可重新打开；Codex 可切换 Fast/Standard 与运行中推理强度，支持 `max`。
+- 审批完成后保留请求快照，展示原请求参数和处理结果，避免待审批队列清理后丢失上下文。
 
 ## 升级建议
 

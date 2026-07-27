@@ -82,6 +82,38 @@ async def set_model_mode(
         return False, f"切换失败: {resp.status} {body[:200]}"
 
 
+async def set_codex_reasoning_effort(
+    client: AsyncHapiClient, sid: str, effort: str | None
+) -> tuple[bool, str]:
+    """设置 Codex 会话的推理强度。"""
+    resp = await client.post(
+        f"/api/sessions/{sid}/model-reasoning-effort",
+        json={"modelReasoningEffort": effort},
+    )
+    if resp.ok:
+        resp.release()
+        return True, f"推理强度已切换为: {effort or '默认'}"
+    body = await resp.text()
+    resp.release()
+    return False, f"切换失败: {resp.status} {body[:200]}"
+
+
+async def set_service_tier(
+    client: AsyncHapiClient, sid: str, tier: str
+) -> tuple[bool, str]:
+    """设置 Codex Fast 或 Standard 服务等级。"""
+    resp = await client.post(
+        f"/api/sessions/{sid}/service-tier", json={"serviceTier": tier}
+    )
+    if resp.ok:
+        resp.release()
+        label = "Fast 已开启" if tier == "fast" else "Fast 已关闭（standard）"
+        return True, label
+    body = await resp.text()
+    resp.release()
+    return False, f"切换失败: {resp.status} {body[:200]}"
+
+
 async def approve_permission(
     client: AsyncHapiClient, sid: str, rid: str, answers: dict | None = None
 ) -> tuple[bool, str]:
@@ -170,6 +202,23 @@ async def resume_session(
         body = await resp.text()
         resp.release()
         return False, f"恢复失败: {resp.status} {body[:200]}", None
+
+
+async def reopen_session(
+    client: AsyncHapiClient, sid: str
+) -> tuple[bool, str, str | None]:
+    """使用 HAPI reopen 接口重新打开 inactive 会话。"""
+    resp = await client.post(f"/api/sessions/{sid}/reopen", json={})
+    if resp.ok:
+        data = await resp.json()
+        resp.release()
+        reopened_sid = (
+            data.get("sessionId") or (data.get("session") or {}).get("id") or sid
+        )
+        return True, f"已重新打开 [{reopened_sid[:8]}]", reopened_sid
+    body = await resp.text()
+    resp.release()
+    return False, f"重新打开失败: {resp.status} {body[:200]}", None
 
 
 async def rename_session(

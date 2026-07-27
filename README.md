@@ -85,9 +85,10 @@ _✨ HAPI 远程 vibe coding 的 Discord 专用版 ✨_
 
 `/dhapi` 打开后的主面板包含：
 
-- **Session 列表**：选择 session 后加入/退出当前窗口订阅、查看状态、停止生成、删除、归档、返回
+- **Session 列表**：选择 session 后加入/退出当前窗口订阅、查看状态、停止生成、重新打开 inactive session、删除、归档、返回
+- **Codex 会话设置**：在 Session 卡片中切换 Fast/Standard，并调整运行中的推理强度（含 `max`）
 - **当前状态**：当前绑定 session 的 flavor / 路径 / 模型 / 权限模式 / 思考状态
-- **审批面板**：选择 pending request 后批准、拒绝、批准全部、刷新、返回；审批通知优先使用 Embed + 原生 Discord 按钮，可直接批准/拒绝/打开审批面板，异常时保留 pending 并降级提示
+- **审批面板**：选择 pending request 后批准、拒绝、批准全部、刷新、返回；单项处理后会保留该请求的完整参数与结果。审批通知优先使用 Embed + 原生 Discord 按钮，可直接批准/拒绝/打开审批面板，异常时保留 pending 并降级提示
 - **创建 session**：Select 分步选 machine / agent / session_type / yolo / reasoning_effort，仅目录走 Modal
 - **配置只读页**：查看连接、推送、自动审批等长期配置
 - **自动审批开关**：开启后 24 小时自动批准非交互式权限请求

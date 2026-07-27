@@ -20,6 +20,7 @@ CODEX_REASONING_EFFORT_OPTIONS = [
     ("medium", "medium"),
     ("high", "high"),
     ("xhigh", "xhigh"),
+    ("max", "max"),
 ]
 CODEX_REASONING_EFFORT_VALUES = [
     value for value, _ in CODEX_REASONING_EFFORT_OPTIONS if value
