@@ -205,6 +205,10 @@ def _extract_codex_block(data: dict, max_len: int) -> str | None:
         return None
     if dtype in ("reasoning", "agent_reasoning"):
         return None
+    # HAPI 0.24+ 会把 Codex 子代理的内部进度事件写入消息流。
+    # 它们没有可供频道阅读的正文，若透传会显示为无意义的占位文本。
+    if dtype in ("agent-run-trace", "agent-run-update"):
+        return None
     if dtype == "message":
         msg_text = data.get("message", "")
         return msg_text[:max_len] if msg_text else "[消息]"

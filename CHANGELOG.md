@@ -1,5 +1,12 @@
 # 更新日志
 
+## v1.3.9 — 跟进 HAPI 上游协议与 Discord 展示适配
+
+1. 适配 HAPI 0.24+ 的 Codex 子代理内部事件：`agent-run-trace` 和 `agent-run-update` 不再被渲染成 Discord 中的 `[Message]` 占位文本，正常回复、工具调用、审批和完成通知不受影响。
+2. 保留 SSE 达到重连上限后的低频自动恢复机制；不回退为必须手动打开 `/dhapi` 才能恢复的旧行为。
+
+> 推荐将 HAPI 升级至 0.24.0 或更高版本，以获得后端对内部子代理事件的原生过滤；本插件仍保留展示层过滤，兼容升级前后的消息流。
+
 ## v1.3.8 — LLM 发送工具始终暴露
 
 - 调整 `dhapi_coding_send_message` 的可见性策略：即使当前窗口尚未加入 session，也保留工具 schema。

@@ -51,8 +51,10 @@ class SSEListener:
         self.conn_fail_count: int = 0
         # 最大重连次数（0 表示无限）
         self._max_reconnect: int = 0
-        # 是否已休眠（达到重连上限）
+        # 是否已休眠（达到重连上限）；休眠后不退出监听，只进入低频自恢复重试
         self._hibernated: bool = False
+        # 休眠提醒只发送一次，避免全局频道刷屏
+        self._hibernate_notified: bool = False
         self._task: asyncio.Task | None = None
         self._remind_task: asyncio.Task | None = None
         self._remind_enabled: bool = False
@@ -157,6 +159,7 @@ class SSEListener:
         self._remind_interval = remind_interval
         self._auto_approve_enabled = auto_approve_enabled
         self._max_reconnect = max_reconnect_attempts
+        self._hibernate_notified = False
         self._debounce_sids: set[str] = set()
         self._debounce_task: asyncio.Task | None = None
         self._completion_sids: dict[str, int] = {}
@@ -253,13 +256,14 @@ class SSEListener:
                         self.conn_error = None
                         was_hibernated = self._hibernated
                         self._hibernated = False
+                        self._hibernate_notified = False
                         if self.conn_fail_count > 0:
                             logger.info(
                                 "SSE 连接已恢复（此前连续失败 %d 次）",
                                 self.conn_fail_count,
                             )
                             if was_hibernated:
-                                await self._push_notification("✅ SSE 连接已恢复", "")
+                                await self._push_notification("✅ SSE 连接已自动恢复", "")
                         backoff = 1
                         self.conn_fail_count = 0
                     buf += chunk
@@ -300,21 +304,29 @@ class SSEListener:
                 if resp is not None:
                     resp.release()
 
-            # 检查是否达到重连上限
+            # 检查是否达到重连上限：进入低频自恢复模式，但不退出监听任务。
             if self._max_reconnect > 0 and self.conn_fail_count >= self._max_reconnect:
                 if not self._active():
                     return
                 self._hibernated = True
-                logger.warning(
-                    "SSE 已连续失败 %d 次，达到重连上限，进入休眠。打开 /dhapi 面板可重新唤醒",
-                    self.conn_fail_count,
-                )
-                await self._push_notification(
-                    f"⚠ SSE 已连续失败 {self.conn_fail_count} 次，达到重连上限，已进入休眠\n"
-                    "打开 /dhapi 面板可重新唤醒并尝试重连",
-                    "",
-                )
-                return
+                backoff = max_backoff * 5
+                if not self._hibernate_notified:
+                    self._hibernate_notified = True
+                    logger.warning(
+                        "SSE 已连续失败 %d 次，达到重连上限，进入低频自恢复重试模式",
+                        self.conn_fail_count,
+                    )
+                    await self._push_notification(
+                        f"⚠ SSE 已连续失败 {self.conn_fail_count} 次，已进入低频自恢复重试\n"
+                        "无需手动打开 /dhapi；连接恢复后会自动通知",
+                        "",
+                    )
+                elif self.conn_fail_count % max(self._max_reconnect, 1) == 0:
+                    logger.warning(
+                        "SSE 仍在低频自恢复重试中，连续失败 %d 次，下一次约 %ds 后重连",
+                        self.conn_fail_count,
+                        backoff,
+                    )
 
             if self.conn_fail_count == 20:
                 logger.warning("SSE 已连续失败 20 次，请检查 HAPI 服务或网络")
@@ -322,7 +334,8 @@ class SSEListener:
             await asyncio.sleep(backoff)
             if not self._active():
                 return
-            backoff = min(backoff * 2, max_backoff)
+            if not self._hibernated:
+                backoff = min(backoff * 2, max_backoff)
 
     async def _handle(self, evt: dict):
         """处理单个 SSE 事件"""
