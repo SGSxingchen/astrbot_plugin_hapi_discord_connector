@@ -86,3 +86,34 @@ def test_reopen_reads_nested_session_id():
     assert ok
     assert sid == "new-session"
     assert client.calls == [("/api/sessions/old-session/reopen", {})]
+
+
+def test_spawn_passes_model_and_reasoning_as_separate_hapi_fields():
+    client = Client(Response({"type": "success", "sessionId": "new-session"}))
+
+    ok, _msg, sid = asyncio.run(
+        SESSION_OPS.spawn_session(
+            client,
+            "machine-1",
+            "/workspace",
+            "codex",
+            model="gpt-5.6-terra",
+            model_reasoning_effort="max",
+        )
+    )
+
+    assert ok
+    assert sid == "new-session"
+    assert client.calls == [
+        (
+            "/api/machines/machine-1/spawn",
+            {
+                "directory": "/workspace",
+                "agent": "codex",
+                "sessionType": "simple",
+                "yolo": False,
+                "modelReasoningEffort": "max",
+                "model": "gpt-5.6-terra",
+            },
+        )
+    ]

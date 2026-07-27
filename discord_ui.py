@@ -272,7 +272,7 @@ class CreateReasoningSelect(discord.ui.Select):
 
 class CreateDirectoryModal(discord.ui.Modal):
     def __init__(self, source: CreateSessionView):
-        super().__init__(title="填写工作目录", custom_id="dhapi:create:directory")
+        super().__init__(title="填写目录与模型", custom_id="dhapi:create:directory")
         self.source = source
         self.directory = discord.ui.InputText(
             label="directory",
@@ -281,6 +281,13 @@ class CreateDirectoryModal(discord.ui.Modal):
             max_length=500,
         )
         self.add_item(self.directory)
+        self.model = discord.ui.InputText(
+            label="model（可选，例如 gpt-5.6-terra）",
+            value=source.model,
+            required=False,
+            max_length=160,
+        )
+        self.add_item(self.model)
 
     async def callback(self, interaction: discord.Interaction):
         if not self.source.is_admin_id(interaction.user.id):
@@ -289,6 +296,7 @@ class CreateDirectoryModal(discord.ui.Modal):
             )
             return
         self.source.directory = str(self.directory.value or "").strip() or "/root"
+        self.source.model = str(self.model.value or "").strip()
         await interaction.response.defer(ephemeral=True)
         view = ConfirmCreateView.from_create_view(self.source)
         await interaction.edit_original_response(embed=view.build_embed(), view=view)
@@ -306,6 +314,7 @@ class CreateSessionView(DhapiBaseView):
         session_type: str = "simple",
         yolo: bool = False,
         reasoning_effort: str = "none",
+        model: str = "",
         directory: str = "/root",
     ):
         super().__init__(plugin, event)
@@ -318,6 +327,7 @@ class CreateSessionView(DhapiBaseView):
         )
         self.yolo = yolo
         self.reasoning_effort = reasoning_effort or "none"
+        self.model = model.strip()
         self.directory = directory or "/root"
         self._add_controls()
 
@@ -331,6 +341,7 @@ class CreateSessionView(DhapiBaseView):
             session_type=self.session_type,
             yolo=self.yolo,
             reasoning_effort=self.reasoning_effort,
+            model=self.model,
             directory=self.directory,
         )
         await self.edit(interaction, view.build_embed(), view)
@@ -362,6 +373,7 @@ class CreateSessionView(DhapiBaseView):
             f"Agent：`{self.agent}`",
             f"Session Type：`{self.session_type}`",
             f"Yolo：`{self.yolo}`",
+            f"Model：`{self.model or 'HAPI 默认'}`",
             f"Reasoning：`{reasoning}`",
             f"Directory：`{_clip(self.directory, 300)}`",
         ]
@@ -387,7 +399,7 @@ class CreateSessionView(DhapiBaseView):
         await self.replace(interaction)
 
     @discord.ui.button(
-        label="手填路径并确认",
+        label="填写目录/模型",
         style=discord.ButtonStyle.primary,
         emoji="📝",
         custom_id="dhapi:create:directory_button",
@@ -440,6 +452,7 @@ class CreateSessionView(DhapiBaseView):
             session_type=self.session_type,
             yolo=self.yolo,
             reasoning_effort=self.reasoning_effort,
+            model=self.model,
             directory=self.directory,
         )
         await self.edit(interaction, view.build_embed("已刷新 machine 列表。"), view)
@@ -472,6 +485,7 @@ class ConfirmCreateView(DhapiBaseView):
         session_type: str,
         yolo: bool,
         reasoning_effort: str,
+        model: str,
         directory: str,
     ):
         super().__init__(plugin, event)
@@ -481,6 +495,7 @@ class ConfirmCreateView(DhapiBaseView):
         self.session_type = session_type
         self.yolo = yolo
         self.reasoning_effort = reasoning_effort
+        self.model = model
         self.directory = directory
 
     @classmethod
@@ -494,6 +509,7 @@ class ConfirmCreateView(DhapiBaseView):
             session_type=view.session_type,
             yolo=view.yolo,
             reasoning_effort=view.reasoning_effort,
+            model=view.model,
             directory=view.directory,
         )
 
@@ -505,6 +521,7 @@ class ConfirmCreateView(DhapiBaseView):
             f"Agent：`{self.agent}`",
             f"Session Type：`{self.session_type}`",
             f"Yolo：`{self.yolo}`",
+            f"Model：`{self.model or 'HAPI 默认'}`",
             f"Reasoning：`{reasoning}`",
             f"Directory：`{_clip(self.directory, 500)}`",
         ]
@@ -535,6 +552,7 @@ class ConfirmCreateView(DhapiBaseView):
             session_type=self.session_type,
             yolo=self.yolo,
             model_reasoning_effort=reasoning,
+            model=self.model or None,
         )
         if not ok or not sid:
             await self.edit(interaction, self.build_embed(f"❌ {msg}"), self)
@@ -573,6 +591,7 @@ class ConfirmCreateView(DhapiBaseView):
             session_type=self.session_type,
             yolo=self.yolo,
             reasoning_effort=self.reasoning_effort,
+            model=self.model,
             directory=self.directory,
         )
         await self.edit(interaction, view.build_embed(), view)

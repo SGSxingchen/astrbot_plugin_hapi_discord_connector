@@ -1,5 +1,10 @@
 # 更新日志
 
+## v1.3.11 — 创建会话支持显式模型参数
+
+1. Discord 创建弹窗新增可选 `model` 字段，例如 `gpt-5.6-terra`；模型与推理强度分开传递，不再把 `max` 解释或替换成 `xhigh`。
+2. `dhapi_coding_create_session` 增加 `model` 参数，并把它原样交给 HAPI。
+
 ## v1.3.10 — Discord 会话控制与审批结果优化
 
 1. Session 卡片新增“重新打开”，可通过 HAPI `reopen` 恢复 inactive session；恢复出新 session 时自动把当前 Discord 窗口切换到新 session 的通知订阅。

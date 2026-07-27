@@ -742,6 +742,7 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         session_type: str = "simple",
         yolo: bool = False,
         model_reasoning_effort: str = "",
+        model: str = "",
     ):
         """创建新的 coding session。
 
@@ -752,6 +753,7 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             session_type(string): session 类型（simple/worktree，默认 simple）
             yolo(boolean): 是否自动批准所有权限（默认 false）
             model_reasoning_effort(string): 仅 Codex 可选；留空表示继承 Codex 默认设置，可选 none/minimal/low/medium/high/xhigh/max
+            model(string): 可选的 HAPI 模型标识，例如 gpt-5.6-terra；会原样传给 HAPI
         """
         # 获取机器列表
         try:
@@ -787,6 +789,7 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
                 return
 
         normalized_effort = (model_reasoning_effort or "").strip().lower()
+        model = (model or "").strip()
         if agent == "codex":
             from .constants import CODEX_REASONING_EFFORT_VALUES
 
@@ -809,6 +812,8 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         }
         if agent == "codex":
             approval_payload["model_reasoning_effort"] = normalized_effort or "inherit"
+        if model:
+            approval_payload["model"] = model
 
         # 请求审批
         approved, reason = await self._require_approval(
@@ -832,6 +837,7 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             session_type,
             yolo,
             model_reasoning_effort=normalized_effort or None,
+            model=model or None,
         )
         if ok and sid:
             await self.state_mgr.join_session(sid, event.unified_msg_origin, agent)

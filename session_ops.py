@@ -277,6 +277,7 @@ async def spawn_session(
     yolo: bool = False,
     worktree_name: str = "",
     model_reasoning_effort: str | None = None,
+    model: str | None = None,
 ) -> tuple[bool, str, str | None]:
     """创建新 session，返回 (成功, 消息, session_id 或 None)"""
     body = {
@@ -289,6 +290,8 @@ async def spawn_session(
         body["worktreeName"] = worktree_name
     if model_reasoning_effort:
         body["modelReasoningEffort"] = model_reasoning_effort
+    if model:
+        body["model"] = model
 
     resp = await client.post(f"/api/machines/{machine_id}/spawn", json=body)
     if resp.status != 200:

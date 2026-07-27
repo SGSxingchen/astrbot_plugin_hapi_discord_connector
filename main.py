@@ -334,6 +334,7 @@ class HapiDiscordConnectorPlugin(Star):
         session_type: str = "simple",
         yolo: bool = False,
         model_reasoning_effort: str = "",
+        model: str = "",
     ) -> str:
         """创建新的 HAPI coding session，成功后绑定到当前 Discord 频道；需要用户审批。
 
@@ -343,7 +344,8 @@ class HapiDiscordConnectorPlugin(Star):
             machine_id(string): 机器 ID，可选，多机器在线时必填。
             session_type(string): session 类型，simple 或 worktree，默认 simple。
             yolo(boolean): 是否自动批准该 session 内所有权限，默认 false。
-            model_reasoning_effort(string): 仅 Codex 可选；留空继承默认，可选 none/minimal/low/medium/high/xhigh。
+            model_reasoning_effort(string): 仅 Codex 可选；留空继承默认，可选 none/minimal/low/medium/high/xhigh/max。
+            model(string): 可选模型标识，例如 gpt-5.6-terra。
         """
         event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
@@ -356,6 +358,7 @@ class HapiDiscordConnectorPlugin(Star):
             session_type,
             yolo,
             model_reasoning_effort,
+            model,
         )
 
     @filter.llm_tool(name="dhapi_coding_change_config")
