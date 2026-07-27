@@ -1455,6 +1455,14 @@ def _pending_label(item: tuple[str, str, dict], sessions_cache: list[dict]) -> s
 
 def _pending_desc(req: dict) -> str:
     args = req.get("arguments") or {}
+    if req.get("type") == "llm_tool":
+        return _clip(
+            formatters.format_llm_approval_arguments(
+                str(req.get("tool") or ""), args, compact=True
+            )
+            or "待处理",
+            100,
+        )
     if isinstance(args, dict):
         raw = ", ".join(f"{k}={v}" for k, v in list(args.items())[:3])
     else:
@@ -1520,11 +1528,25 @@ class ApprovalView(DhapiBaseView):
             desc_lines = [
                 f"共 `{len(self.items)}` 个待审批。",
                 f"当前：**{_pending_label(item, self.plugin.sessions_cache)}**",
-                f"Session：`{sid}`",
-                f"Request ID：`{rid}`",
             ]
             args = req.get("arguments") or {}
-            desc_lines.append(f"参数：```text\n{_clip(args, 1200)}\n```")
+            if req.get("type") == "llm_tool":
+                tool = str(req.get("tool") or "")
+                desc_lines.extend(
+                    [
+                        f"操作：**{formatters.format_llm_approval_tool(tool)}**",
+                        "来源：当前 Discord 频道",
+                        formatters.format_llm_approval_arguments(tool, args),
+                    ]
+                )
+            else:
+                desc_lines.extend(
+                    [
+                        f"Session：`{sid}`",
+                        f"Request ID：`{rid}`",
+                        f"参数：```text\n{_clip(args, 1200)}\n```",
+                    ]
+                )
             desc = "\n".join(desc_lines)
         if note:
             desc += f"\n\n{note}"
@@ -1698,16 +1720,26 @@ class ApprovalResultView(DhapiBaseView):
         args = req.get("arguments") or {}
         remaining = len(self.visible_pending_items())
         result = f"✅ 已{self.action}" if self.ok else f"❌ {self.action}失败"
-        lines = [
-            f"{result}：{self.message}",
-            "",
-            "本次处理的请求：",
-            f"工具：`{tool}`",
-            f"Session：`{sid}`",
-            f"Request ID：`{rid}`",
-            f"参数：```text\n{_clip(args, 1200)}\n```",
-            f"剩余待审批：`{remaining}`",
-        ]
+        lines = [f"{result}：{self.message}", "", "本次处理的请求："]
+        if req.get("type") == "llm_tool":
+            tool_name = str(tool)
+            lines.extend(
+                [
+                    f"操作：**{formatters.format_llm_approval_tool(tool_name)}**",
+                    "来源：当前 Discord 频道",
+                    formatters.format_llm_approval_arguments(tool_name, args),
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"工具：`{tool}`",
+                    f"Session：`{sid}`",
+                    f"Request ID：`{rid}`",
+                    f"参数：```text\n{_clip(args, 1200)}\n```",
+                ]
+            )
+        lines.append(f"剩余待审批：`{remaining}`")
         return make_embed("审批结果", "\n".join(lines), OK if self.ok else ERR)
 
     @discord.ui.button(

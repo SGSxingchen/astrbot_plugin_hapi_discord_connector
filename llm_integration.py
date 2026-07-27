@@ -154,10 +154,12 @@ class LLMIntegration:
         window_total = len(window_items)
 
         # 发送通知到当前窗口
-        args_str = ", ".join(f"{k}={v}" for k, v in args.items())
+        tool_label = formatters.format_llm_approval_tool(tool_name)
+        approval_detail = formatters.format_llm_approval_arguments(tool_name, args)
         msg = f"""🤖 Astrbot 工具调用请求
-  {tool_name}
-  参数: {args_str}
+  操作: {tool_label}
+
+{approval_detail}
 
 当前总共 {total} 个待审批，当前对话窗口共 {window_total} 个待审批，此请求审批序号 {index}
 
@@ -169,9 +171,13 @@ class LLMIntegration:
         embed = None
         try:
             fields = [
-                {"name": "工具", "value": f"`{tool_name}`", "inline": True},
+                {"name": "操作", "value": tool_label, "inline": True},
                 {"name": "序号", "value": f"`{index}`", "inline": True},
-                {"name": "参数", "value": args_str[:1024] or "-", "inline": False},
+                {
+                    "name": "内容",
+                    "value": approval_detail[:1024] or "-",
+                    "inline": False,
+                },
                 {
                     "name": "审批方式",
                     "value": "直接点击下方按钮批准/拒绝，或打开 `/dhapi` → `审批` 面板处理",
@@ -179,7 +185,7 @@ class LLMIntegration:
                 },
             ]
             embed = self.plugin.notification_mgr.make_embed(
-                title=f"待审批 - {tool_name}",
+                title=f"待审批 - {tool_label}",
                 description=f"当前总共 {total} 个待审批，当前 Discord 频道共 {window_total} 个待审批。",
                 color=0xE74C3C,
                 fields=fields,

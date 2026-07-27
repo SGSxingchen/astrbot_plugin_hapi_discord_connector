@@ -12,6 +12,7 @@
 - 将新版 HAPI 会话能力适配到 Discord 卡片：inactive session 可重新打开；Codex 可切换 Fast/Standard 与运行中推理强度，支持 `max`。
 - 审批完成后保留请求快照，展示原请求参数和处理结果，避免待审批队列清理后丢失上下文。
 - 创建 session 支持显式 `model`，与 `modelReasoningEffort` 分离传给 HAPI；例如 `model=gpt-5.6-terra` 与 `modelReasoningEffort=max`。
+- LLM 审批通知和结果卡保留消息的 Markdown 正文，并将创建会话参数渲染为模型、强度、目录等可读字段。
 
 ## 升级建议
 

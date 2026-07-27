@@ -3,6 +3,71 @@
 import json
 
 
+_LLM_APPROVAL_TOOL_LABELS = {
+    "dhapi_coding_send_message": "向 Codex 发送消息",
+    "dhapi_coding_create_session": "创建 Codex 会话",
+    "dhapi_coding_stop_message": "停止 Session 生成",
+    "dhapi_coding_archive_session": "归档 Session",
+    "dhapi_coding_delete_session": "删除 Session",
+    "dhapi_coding_join_session": "加入 Session 通知",
+    "dhapi_coding_leave_session": "退出 Session 通知",
+}
+
+
+def format_llm_approval_tool(tool_name: str) -> str:
+    """返回面向用户的 LLM 审批操作名称。"""
+    return _LLM_APPROVAL_TOOL_LABELS.get(tool_name, tool_name)
+
+
+def format_llm_approval_arguments(
+    tool_name: str, args: dict, *, compact: bool = False
+) -> str:
+    """将 LLM 工具审批参数格式化为可读的 Discord Markdown。"""
+    args = args if isinstance(args, dict) else {}
+    if tool_name == "dhapi_coding_send_message":
+        message = str(args.get("message") or "").strip()
+        if compact:
+            first_line = next((line.strip() for line in message.splitlines() if line.strip()), "")
+            return f"发送消息：{first_line[:80] or '（空）'}"
+        if len(message) > 1800:
+            message = f"{message[:1799]}…"
+        return f"**任务内容**\n{message or '（空）'}"
+
+    if tool_name == "dhapi_coding_create_session":
+        directory = str(args.get("directory") or "未指定")
+        agent = str(args.get("agent") or "codex")
+        model = str(args.get("model") or "HAPI 默认")
+        effort = str(args.get("model_reasoning_effort") or "继承默认")
+        session_type = "独立工作区" if args.get("session_type") == "worktree" else "普通会话"
+        yolo = "是（跳过审批）" if args.get("yolo") else "否（逐次审批）"
+        machine_id = str(args.get("machine_id") or "自动选择")
+        short_machine = (
+            f"{machine_id[:8]}…{machine_id[-5:]}"
+            if len(machine_id) > 16
+            else machine_id
+        )
+        if compact:
+            return f"{agent} · {model} · {effort}"
+        return "\n".join(
+            [
+                "**会话配置**",
+                f"- 代理：`{agent}`",
+                f"- 模型：`{model}`",
+                f"- 推理强度：`{effort}`",
+                f"- 会话模式：{session_type}",
+                f"- 自动批准：{yolo}",
+                f"- 机器：`{short_machine}`",
+                "**工作目录**",
+                f"`{directory}`",
+            ]
+        )
+
+    if compact:
+        return ", ".join(f"{key}={value}" for key, value in list(args.items())[:2])
+    body = json.dumps(args, ensure_ascii=False, indent=2)
+    return f"**参数**\n```json\n{body[:1600]}\n```"
+
+
 def discord_codeblock(text: str, language: str = "text") -> str:
     """用 Discord 代码块包裹文本，避免 Markdown 误解析。"""
     safe = (text or "").replace("```", "`\u200b``")
