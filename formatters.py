@@ -1,7 +1,8 @@
 """纯函数：格式化 session 标签、消息预览、帮助文本等"""
 
 import json
-
+import re
+from html.parser import HTMLParser
 
 _LLM_APPROVAL_TOOL_LABELS = {
     "dhapi_coding_send_message": "向 Codex 发送消息",
@@ -12,6 +13,121 @@ _LLM_APPROVAL_TOOL_LABELS = {
     "dhapi_coding_join_session": "加入 Session 通知",
     "dhapi_coding_leave_session": "退出 Session 通知",
 }
+
+
+class _DiscordHTMLParser(HTMLParser):
+    """将常见 HTML 转为 Discord 可显示的 Markdown。"""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.list_stack: list[list[str | int]] = []
+        self.links: list[tuple[int, str]] = []
+        self.in_pre = 0
+        self.table_cells = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]):
+        attrs_dict = dict(attrs)
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self.parts.append("\n\n## ")
+        elif tag in ("p", "div", "section", "article", "header", "footer"):
+            self.parts.append("\n\n")
+        elif tag == "br":
+            self.parts.append("\n")
+        elif tag in ("strong", "b"):
+            self.parts.append("**")
+        elif tag in ("em", "i"):
+            self.parts.append("*")
+        elif tag in ("del", "s", "strike"):
+            self.parts.append("~~")
+        elif tag == "code" and not self.in_pre:
+            self.parts.append("`")
+        elif tag == "pre":
+            self.in_pre += 1
+            self.parts.append("\n\n```\n")
+        elif tag in ("ul", "ol"):
+            self.list_stack.append([tag, 0])
+            self.parts.append("\n")
+        elif tag == "li":
+            indent = "  " * max(0, len(self.list_stack) - 1)
+            marker = "-"
+            if self.list_stack and self.list_stack[-1][0] == "ol":
+                self.list_stack[-1][1] += 1
+                marker = f"{self.list_stack[-1][1]}."
+            self.parts.append(f"\n{indent}{marker} ")
+        elif tag == "a":
+            href = attrs_dict.get("href") or ""
+            if not href.lower().startswith(("http://", "https://")):
+                href = ""
+            self.links.append((len(self.parts), href))
+        elif tag == "blockquote":
+            self.parts.append("\n\n> ")
+        elif tag == "hr":
+            self.parts.append("\n\n---\n\n")
+        elif tag == "table":
+            self.parts.append("\n\n")
+        elif tag == "tr":
+            self.table_cells = 0
+            self.parts.append("\n")
+        elif tag in ("td", "th"):
+            if self.table_cells:
+                self.parts.append(" | ")
+            self.table_cells += 1
+        elif tag == "img":
+            alt = attrs_dict.get("alt") or ""
+            if alt:
+                self.parts.append(alt)
+
+    def handle_endtag(self, tag: str):
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            self.parts.append("\n")
+        elif tag in ("p", "div", "section", "article", "header", "footer"):
+            self.parts.append("\n")
+        elif tag in ("strong", "b"):
+            self.parts.append("**")
+        elif tag in ("em", "i"):
+            self.parts.append("*")
+        elif tag in ("del", "s", "strike"):
+            self.parts.append("~~")
+        elif tag == "code" and not self.in_pre:
+            self.parts.append("`")
+        elif tag == "pre":
+            self.in_pre = max(0, self.in_pre - 1)
+            self.parts.append("\n```\n")
+        elif tag in ("ul", "ol") and self.list_stack:
+            self.list_stack.pop()
+            self.parts.append("\n")
+        elif tag == "li":
+            self.parts.append("\n")
+        elif tag == "a" and self.links:
+            start, href = self.links.pop()
+            if href:
+                label = "".join(self.parts[start:]).strip()
+                if label:
+                    self.parts[start:] = [f"[{label}]({href})"]
+        elif tag in ("tr", "table"):
+            self.parts.append("\n")
+
+    def handle_data(self, data: str):
+        self.parts.append(data.replace("`", "\\`") if self.in_pre else data)
+
+
+def html_to_discord_markdown(text: str) -> str:
+    """将 HAPI agent 输出中的 HTML 转为 Discord Markdown。"""
+    if not re.search(r"</?[a-zA-Z][^>]*>", text):
+        return text
+
+    parser = _DiscordHTMLParser()
+    try:
+        parser.feed(text)
+        parser.close()
+    except Exception:
+        return text
+
+    rendered = "".join(parser.parts)
+    rendered = re.sub(r"[ \t]+\n", "\n", rendered)
+    rendered = re.sub(r"\n{3,}", "\n\n", rendered)
+    return rendered.strip()
 
 
 def format_llm_approval_tool(tool_name: str) -> str:
@@ -85,17 +201,20 @@ def extract_text_preview(content: dict, max_len: int = 80) -> str | None:
 
     # 纯文本（部分 agent 直接返回字符串）
     if isinstance(inner, str):
-        return inner[:max_len] if inner.strip() else None
+        text = inner[:max_len] if inner.strip() else None
+        return html_to_discord_markdown(text) if text else None
 
     # content blocks 列表（标准格式）
     if isinstance(inner, list):
-        return _extract_from_blocks(inner, max_len)
+        text = _extract_from_blocks(inner, max_len)
+        return html_to_discord_markdown(text) if text else None
 
     # 单个 block（dict）
     if isinstance(inner, dict):
-        return _extract_from_block(inner, max_len)
+        text = _extract_from_block(inner, max_len)
+        return html_to_discord_markdown(text) if text else None
 
-    return str(inner)[:max_len]
+    return html_to_discord_markdown(str(inner)[:max_len])
 
 
 def _extract_from_blocks(blocks: list, max_len: int) -> str | None:

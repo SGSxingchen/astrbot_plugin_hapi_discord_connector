@@ -13,6 +13,7 @@
 - 审批完成后保留请求快照，展示原请求参数和处理结果，避免待审批队列清理后丢失上下文。
 - 创建 session 支持显式 `model`，与 `modelReasoningEffort` 分离传给 HAPI；例如 `model=gpt-5.6-terra` 与 `modelReasoningEffort=max`。
 - LLM 审批通知和结果卡保留消息的 Markdown 正文，并将创建会话参数渲染为模型、强度、目录等可读字段。
+- HAPI Agent 回复中的常见 HTML 会在发送前转换为 Discord Markdown：标题、列表、行内代码、链接和表格均保持可读，避免 Discord 将标签原样显示。
 
 ## 升级建议
 
@@ -24,3 +25,4 @@
 2. 运行会产生 Codex 子代理活动的任务。
 3. 确认频道不再出现 `[Message]: [agent-run-trace]` 或 `[Message]: [agent-run-update]`。
 4. 确认普通回复、工具调用、权限审批和完成通知仍正常投递。
+5. 让 Agent 发送包含标题、列表、代码、链接和表格的 HTML 回复，确认 Discord 中显示为可读的 Markdown，且不再出现 HTML 标签。
