@@ -39,7 +39,9 @@ class BindingManager:
 
         owners = self._session_owners.get(sid)
         if owners is not None:
-            self._session_owners[sid] = [owner for owner in owners if owner != target_umo]
+            self._session_owners[sid] = [
+                owner for owner in owners if owner != target_umo
+            ]
             if not self._session_owners[sid]:
                 self._session_owners.pop(sid, None)
                 self._session_flavor.pop(sid, None)

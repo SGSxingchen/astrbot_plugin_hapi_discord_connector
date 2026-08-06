@@ -263,7 +263,9 @@ class SSEListener:
                                 self.conn_fail_count,
                             )
                             if was_hibernated:
-                                await self._push_notification("✅ SSE 连接已自动恢复", "")
+                                await self._push_notification(
+                                    "✅ SSE 连接已自动恢复", ""
+                                )
                         backoff = 1
                         self.conn_fail_count = 0
                     buf += chunk
@@ -474,7 +476,9 @@ class SSEListener:
                 pending_count = len(self.pending.get(sid, {}))
             if pending_count == 0:
                 prev = self._completion_sids.get(sid)
-                self._completion_sids[sid] = old_seq if prev is None else min(prev, old_seq)
+                self._completion_sids[sid] = (
+                    old_seq if prev is None else min(prev, old_seq)
+                )
                 if self._completion_task is None or self._completion_task.done():
                     self._completion_task = asyncio.create_task(
                         self._debounced_completion()
@@ -632,7 +636,9 @@ class SSEListener:
         try:
             messages = await session_ops.fetch_messages(self.client, sid, limit=50)
         except Exception as exc:
-            logger.warning("agent final trigger 拉取消息失败 (sid=%s): %s", sid[:8], exc)
+            logger.warning(
+                "agent final trigger 拉取消息失败 (sid=%s): %s", sid[:8], exc
+            )
             return
         final_msg = None
         final_text = None

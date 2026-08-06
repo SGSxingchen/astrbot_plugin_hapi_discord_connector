@@ -143,7 +143,9 @@ def format_llm_approval_arguments(
     if tool_name == "dhapi_coding_send_message":
         message = str(args.get("message") or "").strip()
         if compact:
-            first_line = next((line.strip() for line in message.splitlines() if line.strip()), "")
+            first_line = next(
+                (line.strip() for line in message.splitlines() if line.strip()), ""
+            )
             return f"发送消息：{first_line[:80] or '（空）'}"
         if len(message) > 1800:
             message = f"{message[:1799]}…"
@@ -154,7 +156,9 @@ def format_llm_approval_arguments(
         agent = str(args.get("agent") or "codex")
         model = str(args.get("model") or "HAPI 默认")
         effort = str(args.get("model_reasoning_effort") or "继承默认")
-        session_type = "独立工作区" if args.get("session_type") == "worktree" else "普通会话"
+        session_type = (
+            "独立工作区" if args.get("session_type") == "worktree" else "普通会话"
+        )
         yolo = "是（跳过审批）" if args.get("yolo") else "否（逐次审批）"
         machine_id = str(args.get("machine_id") or "自动选择")
         short_machine = (
@@ -480,7 +484,9 @@ def format_bind_status(
         owners = session_owners.get(sid) or []
         if owners:
             if len(owners) == 1:
-                owner_display = owners[0][:20] + "..." if len(owners[0]) > 20 else owners[0]
+                owner_display = (
+                    owners[0][:20] + "..." if len(owners[0]) > 20 else owners[0]
+                )
                 parts.append(f"📌{owner_display}")
             else:
                 parts.append(f"📌{len(owners)}个窗口")
@@ -570,9 +576,7 @@ def format_session_list(
             if len(owners) <= 2:
                 formatter = owner_formatter or (lambda umo: str(umo))
                 parts.append(
-                    "(joined by: "
-                    + ", ".join(formatter(umo) for umo in owners)
-                    + ")"
+                    "(joined by: " + ", ".join(formatter(umo) for umo in owners) + ")"
                 )
             else:
                 parts.append(f"(joined by {len(owners)} windows)")

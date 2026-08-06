@@ -22,7 +22,9 @@ from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
 from astrbot.core.platform.sources.discord.discord_platform_adapter import (
     DiscordPlatformAdapter,
 )
-from astrbot.core.platform.sources.discord.discord_platform_event import DiscordPlatformEvent
+from astrbot.core.platform.sources.discord.discord_platform_event import (
+    DiscordPlatformEvent,
+)
 
 
 @dataclass
@@ -233,7 +235,9 @@ class AgentFinalTrigger:
         try:
             session = MessageSession.from_str(umo)
         except Exception as exc:
-            raise RuntimeError(f"invalid target unified_msg_origin {umo!r}: {exc}") from exc
+            raise RuntimeError(
+                f"invalid target unified_msg_origin {umo!r}: {exc}"
+            ) from exc
 
         platform = self._find_discord_platform(session.platform_name)
         if platform is None:
@@ -241,7 +245,9 @@ class AgentFinalTrigger:
 
         client = platform.client
         if client is None:
-            raise RuntimeError(f"live Discord client unavailable for synthetic event umo={umo}")
+            raise RuntimeError(
+                f"live Discord client unavailable for synthetic event umo={umo}"
+            )
 
         return session, platform, client
 
@@ -262,13 +268,17 @@ class AgentFinalTrigger:
 
     def _fallback_sender_id(self, umo: str) -> str | None:
         try:
-            admins = [str(x) for x in self.plugin.context.get_config(umo).get("admins_id", [])]
+            admins = [
+                str(x) for x in self.plugin.context.get_config(umo).get("admins_id", [])
+            ]
             if admins:
                 return admins[0]
         except Exception:
             pass
         try:
-            admins = [str(x) for x in self.plugin.context.get_config().get("admins_id", [])]
+            admins = [
+                str(x) for x in self.plugin.context.get_config().get("admins_id", [])
+            ]
             if admins:
                 return admins[0]
         except Exception:
@@ -280,7 +290,10 @@ class AgentFinalTrigger:
         return session.message_type.value == "GroupMessage"
 
     def _raw_message(
-        self, payload: AgentFinalPayload, target_umo: str, final_meta: dict[str, Any] | None = None
+        self,
+        payload: AgentFinalPayload,
+        target_umo: str,
+        final_meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         raw = {
             "synthetic": True,
@@ -295,7 +308,10 @@ class AgentFinalTrigger:
         return raw
 
     def _refresh_event_flags(
-        self, event, payload: AgentFinalPayload, final_meta: dict[str, Any] | None = None
+        self,
+        event,
+        payload: AgentFinalPayload,
+        final_meta: dict[str, Any] | None = None,
     ) -> None:
         event.clear_result()
         event._force_stopped = False
@@ -326,7 +342,11 @@ class AgentFinalTrigger:
         final_meta: dict[str, Any] | None = None,
         base_message_obj=None,
     ) -> AstrBotMessage:
-        msg = copy.copy(base_message_obj) if base_message_obj is not None else AstrBotMessage()
+        msg = (
+            copy.copy(base_message_obj)
+            if base_message_obj is not None
+            else AstrBotMessage()
+        )
         msg.type = session.message_type
         msg.self_id = str(platform.bot_self_id or "")
         msg.session_id = session.session_id
