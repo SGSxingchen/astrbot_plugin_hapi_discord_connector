@@ -12,9 +12,9 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 from . import session_ops
+from .agent_final_trigger import AgentFinalPayload, AgentFinalTrigger
 from .binding_manager import BindingManager
 from .cf_access import CfAccessManager
-from .agent_final_trigger import AgentFinalPayload, AgentFinalTrigger
 from .hapi_client import AsyncHapiClient
 from .notification_manager import NotificationManager
 from .pending_manager import PendingManager
@@ -46,7 +46,9 @@ async def _cancel_stale_sse_tasks():
     sse_listener.py before starting the new singleton listener.
     """
     current = asyncio.current_task()
-    sse_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "sse_listener.py"))
+    sse_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "sse_listener.py")
+    )
     stale_tasks = []
     for task in asyncio.all_tasks():
         if task is current or task.done():
@@ -86,7 +88,7 @@ async def _cancel_stale_sse_tasks():
     "astrbot_plugin_hapi_discord_connector",
     "SGSxingchen",
     "HAPI 远程 coding 的 Discord 专用版：/dhapi 原生交互与 session 管理",
-    "1.3.7",
+    "2.1.0",
 )
 class HapiDiscordConnectorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -177,9 +179,102 @@ class HapiDiscordConnectorPlugin(Star):
         """
         try:
             name = str(event.get_platform_name() or "").strip().lower()
-            return name == "discord" or "(discord)" in name or name.endswith(":discord")
+            return HapiDiscordConnectorPlugin._is_discord_platform_name(name)
         except Exception:
             return False
+
+    @staticmethod
+    def _is_discord_platform_name(name: str) -> bool:
+        """Return whether a platform name identifies a Discord adapter.
+
+        Args:
+            name: Platform display name or canonical platform type.
+
+        Returns:
+            Whether the name is a Discord platform identifier.
+        """
+        value = str(name or "").strip().lower()
+        return value == "discord" or "(discord)" in value or value.endswith(":discord")
+
+    def _background_direct_authorized(self, event: AstrMessageEvent) -> bool:
+        """Authorize an exact configured AstrBot cron job for direct mode.
+
+        The scheduler event and its database-issued job ID cannot be supplied by
+        a normal Discord tool call. An exact ID allowlist keeps direct mode
+        disabled unless an operator explicitly opts a cron job in.
+
+        Args:
+            event: Event passed to the LLM tool handler.
+
+        Returns:
+            Whether the event is an allowed cron job.
+        """
+        if not bool(self.config.get("background_direct_enabled", False)):
+            return False
+        try:
+            from astrbot.core.cron.events import CronMessageEvent
+
+            if not isinstance(event, CronMessageEvent):
+                return False
+            if str(event.get_platform_name() or "").strip().lower() != "cron":
+                return False
+            cron_job = event.get_extra("cron_job", {})
+        except Exception:
+            return False
+        if not isinstance(cron_job, dict):
+            return False
+        job_id = str(cron_job.get("id") or "").strip()
+        allowed_ids = {
+            str(value).strip()
+            for value in self.config.get("background_allowed_cron_job_ids", [])
+            if str(value).strip()
+        }
+        return bool(job_id) and job_id in allowed_ids
+
+    def _background_direct_denied_text(self) -> str:
+        """Build a stable denial message without exposing configuration details."""
+        return (
+            "后台直连未获授权：仅允许在插件已启用后台直连且 cron 任务 ID 被"
+            "精确加入白名单时调用。"
+        )
+
+    def _select_background_approval_umo(self, session_id: str) -> str | None:
+        """Select one live Discord binding for a background approval request.
+
+        Args:
+            session_id: Canonical HAPI session ID.
+
+        Returns:
+            The first still-live Discord UMO in persisted join order, or None.
+        """
+        owners = self.binding_mgr.get_owners(session_id)
+        try:
+            platforms = self.context.platform_manager.platform_insts
+        except Exception:
+            logger.warning(
+                "[dhapi] background route unavailable: platform manager is missing sid=%s",
+                session_id[:8],
+            )
+            return None
+
+        for umo in owners:
+            platform_id = str(umo or "").split(":", 1)[0]
+            for platform in platforms:
+                try:
+                    meta = platform.meta()
+                    if str(meta.id) == platform_id and self._is_discord_platform_name(
+                        str(meta.name)
+                    ):
+                        return umo
+                except Exception:
+                    continue
+
+        logger.warning(
+            "[dhapi] background route has no active Discord binding sid=%s owners=%d",
+            session_id[:8],
+            len(owners),
+        )
+        return None
 
     async def _notify_from_sse(self, text: str, sid: str):
         """Generation-guarded SSE notification callback."""
@@ -209,22 +304,35 @@ class HapiDiscordConnectorPlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request_hook(self, event: AstrMessageEvent, request):
-        """LLM 工具可见性控制钩子；非 Discord 平台移除 dhapi 工具。"""
-        if not self._is_discord_event(event):
-            self.llm_integration._remove_hapi_tools(request, keep_basic=False)
+        """Control tool visibility for Discord and explicitly allowed cron jobs."""
+        if self._is_discord_event(event):
+            self.agent_final_trigger.remember_event(event)
+            await self.llm_integration.on_llm_request_hook(event, request)
             return
-        self.agent_final_trigger.remember_event(event)
-        await self.llm_integration.on_llm_request_hook(event, request)
+        if self._background_direct_authorized(event):
+            self.llm_integration.restrict_to_background_direct_tools(request)
+            return
+        self.llm_integration._remove_hapi_tools(request, keep_basic=False)
 
     # ──── LLM 工具代理方法 ────
 
     @filter.llm_tool(name="dhapi_coding_get_status")
-    async def tool_get_status(self, event: AstrMessageEvent, session_id: str = "") -> str:
-        """获取 HAPI session 状态；仅允许当前窗口已加入的 session，优先省略 session_id。"""
+    async def tool_get_status(
+        self, event: AstrMessageEvent, session_id: str = ""
+    ) -> str:
+        """获取 HAPI session 状态。
+
+        Args:
+            session_id(string): Discord 可省略；受控 cron 后台模式必须填写完整 ID 或唯一前缀。
+        """
         event = self._unwrap_tool_event(event)
-        if not self._is_discord_event(event):
-            return "dhapi 工具仅支持 Discord 平台。"
-        return await self.llm_integration.tool_get_status(event, session_id)
+        if self._is_discord_event(event):
+            return await self.llm_integration.tool_get_status(event, session_id)
+        if self._background_direct_authorized(event):
+            return await self.llm_integration.tool_get_status_background(
+                event, session_id
+            )
+        return self._background_direct_denied_text()
 
     @filter.llm_tool(name="dhapi_coding_list_sessions")
     async def tool_list_sessions(
@@ -258,12 +366,18 @@ class HapiDiscordConnectorPlugin(Star):
 
         Args:
             rounds(number): 查询最近几轮消息，默认 1 轮。
-            session_id(string): 可选；只能解析当前窗口已加入 session 的序号/短前缀/ID，优先省略。
+            session_id(string): Discord 可省略；受控 cron 后台模式必须填写完整 ID 或唯一前缀。
         """
         event = self._unwrap_tool_event(event)
-        if not self._is_discord_event(event):
-            return "dhapi 工具仅支持 Discord 平台。"
-        return await self.llm_integration.tool_message_history(event, rounds, session_id)
+        if self._is_discord_event(event):
+            return await self.llm_integration.tool_message_history(
+                event, rounds, session_id
+            )
+        if self._background_direct_authorized(event):
+            return await self.llm_integration.tool_message_history_background(
+                event, rounds, session_id
+            )
+        return self._background_direct_denied_text()
 
     @filter.llm_tool(name="dhapi_coding_get_config_status")
     async def tool_get_config_status(self, event: AstrMessageEvent) -> str:
@@ -289,16 +403,22 @@ class HapiDiscordConnectorPlugin(Star):
     async def tool_send_message(
         self, event: AstrMessageEvent, message: str, session_id: str = ""
     ) -> str:
-        """向 HAPI session 发送消息；需要用户在 Discord 中审批。
+        """向 HAPI session 发送消息；后台审批将路由回绑定 Discord 窗口。
 
         Args:
             message(string): 要发送给 coding agent 的消息内容。
-            session_id(string): 可选；只能解析当前窗口已加入 session 的序号/短前缀/ID，优先省略。
+            session_id(string): Discord 可省略；受控 cron 后台模式必须填写完整 ID 或唯一前缀。
         """
         event = self._unwrap_tool_event(event)
-        if not self._is_discord_event(event):
-            return "dhapi 工具仅支持 Discord 平台。"
-        return await self.llm_integration.tool_send_message(event, message, session_id)
+        if self._is_discord_event(event):
+            return await self.llm_integration.tool_send_message(
+                event, message, session_id
+            )
+        if self._background_direct_authorized(event):
+            return await self.llm_integration.tool_send_message_background(
+                event, message, session_id
+            )
+        return self._background_direct_denied_text()
 
     @filter.llm_tool(name="dhapi_coding_join_session")
     async def tool_join_session(self, event: AstrMessageEvent, session_id: str) -> str:
@@ -313,7 +433,9 @@ class HapiDiscordConnectorPlugin(Star):
         return await self.llm_integration.tool_join_session(event, session_id)
 
     @filter.llm_tool(name="dhapi_coding_leave_session")
-    async def tool_leave_session(self, event: AstrMessageEvent, session_id: str = "") -> str:
+    async def tool_leave_session(
+        self, event: AstrMessageEvent, session_id: str = ""
+    ) -> str:
         """当前 Discord 窗口退出 HAPI session 订阅；需要用户审批。
 
         Args:
@@ -377,7 +499,9 @@ class HapiDiscordConnectorPlugin(Star):
         return await self.llm_integration.tool_change_config(event, config_name, value)
 
     @filter.llm_tool(name="dhapi_coding_stop_message")
-    async def tool_stop_message(self, event: AstrMessageEvent, session_id: str = "") -> str:
+    async def tool_stop_message(
+        self, event: AstrMessageEvent, session_id: str = ""
+    ) -> str:
         """停止 HAPI session 的消息生成；需要用户审批。"""
         event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
@@ -385,7 +509,9 @@ class HapiDiscordConnectorPlugin(Star):
         return await self.llm_integration.tool_stop_message(event, session_id)
 
     @filter.llm_tool(name="dhapi_coding_archive_session")
-    async def tool_archive_session(self, event: AstrMessageEvent, session_id: str = "") -> str:
+    async def tool_archive_session(
+        self, event: AstrMessageEvent, session_id: str = ""
+    ) -> str:
         """归档 HAPI session；危险操作，需要用户审批。"""
         event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):
@@ -393,7 +519,9 @@ class HapiDiscordConnectorPlugin(Star):
         return await self.llm_integration.tool_archive_session(event, session_id)
 
     @filter.llm_tool(name="dhapi_coding_delete_session")
-    async def tool_delete_session(self, event: AstrMessageEvent, session_id: str = "") -> str:
+    async def tool_delete_session(
+        self, event: AstrMessageEvent, session_id: str = ""
+    ) -> str:
         """删除 HAPI session；危险操作，需要用户审批。"""
         event = self._unwrap_tool_event(event)
         if not self._is_discord_event(event):

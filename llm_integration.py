@@ -117,6 +117,38 @@ class LLMIntegration:
         for tool_name in joined_scope_tools:
             request.func_tool.remove_tool(tool_name)
 
+    def restrict_to_background_direct_tools(self, request: ProviderRequest):
+        """Keep only the safe tools supported by the authorized cron mode.
+
+        Args:
+            request: The provider request whose Function Calling schema is filtered.
+        """
+        if not hasattr(request, "func_tool") or not request.func_tool:
+            return
+        allowed_tools = {
+            "dhapi_coding_get_status",
+            "dhapi_coding_message_history",
+            "dhapi_coding_send_message",
+        }
+        all_tools = {
+            "dhapi_coding_get_status",
+            "dhapi_coding_list_sessions",
+            "dhapi_coding_message_history",
+            "dhapi_coding_get_config_status",
+            "dhapi_coding_list_commands",
+            "dhapi_coding_send_message",
+            "dhapi_coding_join_session",
+            "dhapi_coding_leave_session",
+            "dhapi_coding_create_session",
+            "dhapi_coding_change_config",
+            "dhapi_coding_stop_message",
+            "dhapi_coding_archive_session",
+            "dhapi_coding_delete_session",
+            "dhapi_coding_execute_command",
+        }
+        for tool_name in all_tools - allowed_tools:
+            request.func_tool.remove_tool(tool_name)
+
     # ──── 审批机制 ────
 
     async def _require_approval(
@@ -257,7 +289,9 @@ class LLMIntegration:
         列表序号都只能在这个候选集合内解析，禁止从全局 sessions_cache 或
         长期记忆补全到未 joined 的旧 session。
         """
-        joined = self.state_mgr.binding_mgr.get_window_sessions(event.unified_msg_origin)
+        joined = self.state_mgr.binding_mgr.get_window_sessions(
+            event.unified_msg_origin
+        )
         by_sid = {
             session.get("id"): session
             for session in self.sessions_cache
@@ -314,8 +348,7 @@ class LLMIntegration:
                 None,
                 "当前窗口已加入多个 session。为避免串线，请在下一轮工具调用里"
                 "只使用下方当前窗口 joined 列表中的序号或短前缀，"
-                "不要使用长期记忆里的旧完整 UUID：\n"
-                + "\n".join(lines[:10]),
+                "不要使用长期记忆里的旧完整 UUID：\n" + "\n".join(lines[:10]),
             )
 
         if explicit.isdigit():
@@ -379,6 +412,186 @@ class LLMIntegration:
                 return "".join(parts)
         return str(result)
 
+    def _resolve_background_sid_text(
+        self, session_id: str | None
+    ) -> tuple[str | None, str | None]:
+        """Resolve a direct-mode target from persistently bound session IDs only.
+
+        Args:
+            session_id: Full HAPI session ID or an unambiguous prefix.
+
+        Returns:
+            A canonical session ID and an error message, if any.
+        """
+        explicit = str(session_id or "").strip()
+        if not explicit:
+            return None, "后台模式必须显式提供 session_id；不会自动选择任何 session。"
+
+        bindings = self.state_mgr.binding_mgr.get_all_bindings()
+        candidates = [sid for sid, owners in bindings.items() if sid and owners]
+        matches = [sid for sid in candidates if sid.startswith(explicit)]
+        if len(matches) == 1:
+            return matches[0], None
+        if len(matches) > 1:
+            return (
+                None,
+                f"后台模式匹配到 {len(matches)} 个已绑定 session，请提供更长的 ID 前缀。",
+            )
+        return (
+            None,
+            "后台模式拒绝该 session：目标必须是已绑定 Discord 窗口的完整 ID 或唯一前缀。",
+        )
+
+    async def _resolve_background_target(
+        self, session_id: str | None
+    ) -> tuple[str | None, str | None, str | None]:
+        """Refresh and validate a direct-mode session plus its Discord route.
+
+        Args:
+            session_id: Full HAPI session ID or an unambiguous prefix.
+
+        Returns:
+            The canonical ID, selected Discord UMO, and an error message.
+        """
+        sid, error = self._resolve_background_sid_text(session_id)
+        if error:
+            return None, None, error
+        try:
+            await self.plugin._refresh_sessions()
+        except Exception:
+            return None, None, "后台模式无法刷新 HAPI session 列表，请稍后重试。"
+        if not self.validate_sid(sid):
+            return None, None, self._missing_sid_text(sid)
+
+        target_umo = self.plugin._select_background_approval_umo(sid)
+        if not target_umo:
+            return (
+                None,
+                None,
+                "后台模式拒绝该 session：没有仍在线且可验证的 Discord 绑定窗口。",
+            )
+        return sid, target_umo, None
+
+    @staticmethod
+    def _background_notice_event(umo: str):
+        """Create the small event surface used by Discord approval views.
+
+        Args:
+            umo: Persisted Discord unified message origin.
+
+        Returns:
+            An event-like object scoped to the bound Discord window.
+        """
+
+        class _BackgroundNoticeEvent:
+            unified_msg_origin = umo
+            session_id = ""
+
+            @staticmethod
+            def get_sender_id() -> str:
+                return ""
+
+        return _BackgroundNoticeEvent()
+
+    async def _require_background_approval(
+        self, tool_name: str, args: dict, target_umo: str
+    ) -> tuple[bool, str]:
+        """Send one approval card to a bound Discord window and await its result.
+
+        Args:
+            tool_name: Canonical LLM tool name.
+            args: Human-readable operation arguments.
+            target_umo: Selected bound Discord unified message origin.
+
+        Returns:
+            Whether the request was approved and its outcome reason.
+        """
+        req_id, future, index = self.pending_mgr.add_llm_tool_request(
+            target_umo, tool_name, args
+        )
+        tool_label = formatters.format_llm_approval_tool(tool_name)
+        approval_detail = formatters.format_llm_approval_arguments(tool_name, args)
+        all_pending = self.pending_mgr.flatten_pending(None, None)
+        window_pending = self.pending_mgr.flatten_pending(
+            self._background_notice_event(target_umo), {target_umo}
+        )
+        description = f"""🤖 授权后台任务请求
+操作: {tool_label}
+
+{approval_detail}
+
+当前总共 {len(all_pending)} 个待审批，当前 Discord 窗口共 {len(window_pending)} 个待审批，此请求审批序号 {index}
+
+此请求来自已授权的 AstrBot cron 任务。"""
+        try:
+            from .discord_ui import ApprovalNoticeView
+
+            view = ApprovalNoticeView(
+                self.plugin,
+                self._background_notice_event(target_umo),
+                target_umo,
+                req_id,
+            )
+            await self.plugin.notification_mgr.push_embed(
+                target_umo,
+                f"待审批 - {tool_label}",
+                description,
+                0xE74C3C,
+                fields=[
+                    {"name": "操作", "value": tool_label, "inline": True},
+                    {"name": "序号", "value": f"`{index}`", "inline": True},
+                    {
+                        "name": "来源",
+                        "value": "已授权的 AstrBot cron 任务",
+                        "inline": False,
+                    },
+                ],
+                footer="后台 LLM 工具审批 | HAPI Discord Connector",
+                view=view,
+            )
+        except Exception as exc:
+            self.pending_mgr.remove_entry(target_umo, req_id)
+            logger.warning(
+                "后台 LLM 审批卡投递失败 sid=%s: %s",
+                str(args.get("session_id") or "")[:8],
+                exc,
+            )
+            return False, "notification_failed"
+
+        try:
+            approved = await asyncio.wait_for(future, timeout=60)
+            return (True, "approved") if approved else (False, "denied")
+        except asyncio.TimeoutError:
+            self.pending_mgr.remove_entry(target_umo, req_id)
+            return False, "timeout"
+        except asyncio.CancelledError:
+            self.pending_mgr.remove_entry(target_umo, req_id)
+            raise
+
+    async def _background_send_can_auto_approve(self, sid: str) -> bool:
+        """Check explicit direct-send policies without inferring permission state.
+
+        Args:
+            sid: Canonical HAPI session ID.
+
+        Returns:
+            Whether the configured policy permits sending without a card approval.
+        """
+        if bool(
+            self.plugin.config.get(
+                "background_direct_allow_global_auto_approve_send", False
+            )
+        ) and bool(self.plugin.sse_listener._auto_approve_enabled):
+            return True
+        if not bool(self.plugin.config.get("background_direct_allow_yolo_send", False)):
+            return False
+        try:
+            detail = await session_ops.fetch_session_detail(self.client, sid)
+        except Exception as exc:
+            logger.warning("后台直发无法确认 yolo 权限模式 sid=%s: %s", sid[:8], exc)
+            return False
+        return str(detail.get("permissionMode") or "").strip().lower() == "yolo"
+
     # ──── 查询类工具（无需审批）────
 
     async def tool_get_status(self, event: AstrMessageEvent, session_id: str = ""):
@@ -394,6 +607,28 @@ class LLMIntegration:
             return formatters.format_session_status(detail)
         except Exception as e:
             return f"获取状态失败: {e}"
+
+    async def tool_get_status_background(
+        self, event: AstrMessageEvent, session_id: str = ""
+    ):
+        """Get status through the authorized explicit-session background path.
+
+        Args:
+            event: Authorized non-Discord event; used by the caller authorization gate.
+            session_id: Required full HAPI session ID or an unambiguous prefix.
+
+        Returns:
+            A formatted status result or a safe rejection message.
+        """
+        _ = event
+        sid, _target_umo, error = await self._resolve_background_target(session_id)
+        if error:
+            return error
+        try:
+            detail = await session_ops.fetch_session_detail(self.client, sid)
+            return formatters.format_session_status(detail)
+        except Exception as exc:
+            return f"获取状态失败: {exc}"
 
     async def tool_list_sessions(
         self,
@@ -523,10 +758,48 @@ class LLMIntegration:
         except Exception as e:
             return f"获取消息失败: {e}"
 
+    async def tool_message_history_background(
+        self, event: AstrMessageEvent, rounds: int = 1, session_id: str = ""
+    ):
+        """Read history through the authorized explicit-session background path.
+
+        Args:
+            event: Authorized non-Discord event; used by the caller authorization gate.
+            rounds: Number of recent conversation rounds to return.
+            session_id: Required full HAPI session ID or an unambiguous prefix.
+
+        Returns:
+            Formatted message history or a safe rejection message.
+        """
+        _ = event
+        sid, _target_umo, error = await self._resolve_background_target(session_id)
+        if error:
+            return error
+        try:
+            fetch_limit = min(rounds * 80, 500)
+            msgs = await session_ops.fetch_messages(self.client, sid, limit=fetch_limit)
+            selected = formatters.split_into_rounds(msgs)[-rounds:]
+            if not selected:
+                return "暂无消息记录"
+            return "\n\n".join(
+                formatters.format_round(round_msgs, index, len(selected))
+                for index, round_msgs in enumerate(selected, 1)
+            )
+        except Exception as exc:
+            return f"获取消息失败: {exc}"
+
     async def tool_get_config_status(self, event: AstrMessageEvent):
         """获取当前插件配置状态及可修改项说明。"""
         output_level = self.plugin.config.get("output_level", "simple")
         auto_approve = self.plugin.sse_listener._auto_approve_enabled
+        background_direct = self.plugin.config.get("background_direct_enabled", False)
+        background_jobs = self.plugin.config.get("background_allowed_cron_job_ids", [])
+        background_yolo_send = self.plugin.config.get(
+            "background_direct_allow_yolo_send", False
+        )
+        background_global_auto_send = self.plugin.config.get(
+            "background_direct_allow_global_auto_approve_send", False
+        )
         remind = self.plugin.sse_listener._remind_enabled
         remind_interval = self.plugin.sse_listener._remind_interval
         agent_final_trigger = self.plugin.config.get(
@@ -549,6 +822,13 @@ output_level (SSE推送级别): {output_level}
 
 auto_approve_enabled (24小时自动审批): {"开启" if auto_approve else "关闭"}
   开启后全天自动批准非 question 权限请求
+  值: true/false
+
+background_direct_enabled (受控 cron 后台直连): {"开启" if background_direct else "关闭"}
+  仅精确白名单 cron 任务可按完整 session_id/唯一前缀查询、读历史、续派
+  cron 白名单: {background_jobs}
+  yolo 直发: {"开启" if background_yolo_send else "关闭"}
+  全局自动审批直发: {"开启" if background_global_auto_send else "关闭"}
   值: true/false
 
 remind_pending (定时提醒待审批): {"开启" if remind else "关闭"}
@@ -612,7 +892,47 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
         ok, result = await session_ops.send_message(self.client, sid, message)
         return result if ok else f"发送失败: {result}"
 
-    def _find_session_by_id_or_prefix(self, target: str) -> tuple[dict | None, str | None]:
+    async def tool_send_message_background(
+        self, event: AstrMessageEvent, message: str, session_id: str = ""
+    ):
+        """Send through the authorized explicit-session background path.
+
+        Args:
+            event: Authorized non-Discord event; used by the caller authorization gate.
+            message: Content to send to the HAPI session.
+            session_id: Required full HAPI session ID or an unambiguous prefix.
+
+        Returns:
+            The HAPI result or an approval/rejection message.
+        """
+        _ = event
+        sid, target_umo, error = await self._resolve_background_target(session_id)
+        if error:
+            return error
+
+        if not await self._background_send_can_auto_approve(sid):
+            approved, reason = await self._require_background_approval(
+                "dhapi_coding_send_message",
+                {
+                    "message": message,
+                    "session_id": sid[:8],
+                    "background_direct": True,
+                },
+                target_umo,
+            )
+            if not approved:
+                if reason == "timeout":
+                    return "操作超时：60秒内未收到绑定 Discord 窗口的审批。"
+                if reason == "notification_failed":
+                    return "操作失败：无法向已绑定 Discord 窗口投递审批请求。"
+                return "操作已被用户拒绝，请停止工具调用。"
+
+        ok, result = await session_ops.send_message(self.client, sid, message)
+        return result if ok else f"发送失败: {result}"
+
+    def _find_session_by_id_or_prefix(
+        self, target: str
+    ) -> tuple[dict | None, str | None]:
         """按完整 ID / 前缀 / 列表序号解析 session。"""
         sessions = self.sessions_cache
         value = (target or "").strip()

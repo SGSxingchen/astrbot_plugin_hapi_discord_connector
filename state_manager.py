@@ -26,7 +26,9 @@ class StateManager:
 
     async def persist_session_owners(self):
         """持久化 session -> 多窗口订阅关系。"""
-        await self.kv.put_kv_data("dhapi_session_owners", self.binding_mgr.get_all_bindings())
+        await self.kv.put_kv_data(
+            "dhapi_session_owners", self.binding_mgr.get_all_bindings()
+        )
 
     async def _delete_kv_key(self, key: str):
         """删除 KV key；优先使用 delete_kv_data，兼容旧 KV helper 的 put None。"""
@@ -304,7 +306,9 @@ class StateManager:
         seen: set[str] = set()
         for state in self._user_states_cache.values():
             self._append_unique(
-                targets, seen, self.normalized_flavor_primary_umos(state).get(flavor_key)
+                targets,
+                seen,
+                self.normalized_flavor_primary_umos(state).get(flavor_key),
             )
         for umo in self._flavor_primary_windows_cache.get(flavor_key, []):
             self._append_unique(targets, seen, umo)
@@ -440,7 +444,9 @@ class StateManager:
                 else:
                     owner_list = []
                 for umo in owner_list:
-                    self.binding_mgr.join(sid, umo, self.binding_mgr.get_session_flavor(sid) or "unknown")
+                    self.binding_mgr.join(
+                        sid, umo, self.binding_mgr.get_session_flavor(sid) or "unknown"
+                    )
 
         # 忽略并尽力清理已知旧窗口当前状态 KV。
         legacy_umos: list[str] = []
@@ -480,7 +486,9 @@ class StateManager:
                     target_umo = owners[-1]
                 if target_umo:
                     legacy_umos.append(str(target_umo))
-                    self.binding_mgr.join(str(old_session), str(target_umo), str(old_flavor))
+                    self.binding_mgr.join(
+                        str(old_session), str(target_umo), str(old_flavor)
+                    )
                     migrated = True
                     logger.info(
                         "迁移用户 %s: current_session → join[%s]",
@@ -505,7 +513,9 @@ class StateManager:
             for umo in known_chats:
                 await self._delete_kv_key(f"dhapi_chat_binding_{umo}")
             legacy_umos.extend(str(umo) for umo in known_chats)
-            logger.info("已清理 %d 个废弃的 chat_binding/window_state 数据", len(known_chats))
+            logger.info(
+                "已清理 %d 个废弃的 chat_binding/window_state 数据", len(known_chats)
+            )
             migrated = True
 
         legacy_umos.extend(self.get_primary_windows())

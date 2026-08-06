@@ -78,6 +78,30 @@
     "default": false,
     "hint": "⚠️ 请谨慎开启，启用后 AI 将无需确认自动执行非 question 权限请求"
   },
+  "background_direct_enabled": {
+    "description": "允许受控 cron 按 session_id 后台直连（默认关闭）",
+    "type": "bool",
+    "default": false,
+    "hint": "仅对 background_allowed_cron_job_ids 中精确匹配的 AstrBot cron 任务生效；不会向普通消息或其他平台开放"
+  },
+  "background_allowed_cron_job_ids": {
+    "description": "允许后台直连的 AstrBot cron 任务 ID 白名单",
+    "type": "list",
+    "default": [],
+    "hint": "必须填写 Scheduler 中已创建任务的精确 job_id；留空即使开启后台模式也全部拒绝"
+  },
+  "background_direct_allow_yolo_send": {
+    "description": "允许已确认 yolo session 的受控后台任务直接续派",
+    "type": "bool",
+    "default": false,
+    "hint": "仍要求后台任务白名单和已绑定在线 Discord 窗口；插件会从 HAPI session 详情确认 permissionMode=yolo"
+  },
+  "background_direct_allow_global_auto_approve_send": {
+    "description": "允许全局自动审批开启时受控后台任务直接续派",
+    "type": "bool",
+    "default": false,
+    "hint": "仍要求后台任务白名单和已绑定在线 Discord 窗口；关闭时非 yolo 续派一律发回 Discord 审批"
+  },
   "embed_enabled": {
     "description": "Discord Embed 推送",
     "type": "bool",
