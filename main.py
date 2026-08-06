@@ -88,7 +88,7 @@ async def _cancel_stale_sse_tasks():
     "astrbot_plugin_hapi_discord_connector",
     "SGSxingchen",
     "HAPI 远程 coding 的 Discord 专用版：/dhapi 原生交互与 session 管理",
-    "1.4.0",
+    "2.1.0",
 )
 class HapiDiscordConnectorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
