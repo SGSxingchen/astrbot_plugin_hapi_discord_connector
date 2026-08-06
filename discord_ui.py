@@ -652,7 +652,9 @@ class DhapiMainView(DhapiBaseView):
     def panel_embed(plugin, event) -> discord.Embed:
         joined = plugin.binding_mgr.get_window_sessions(event.unified_msg_origin)
         if len(joined) == 1:
-            session = next((s for s in plugin.sessions_cache if s.get("id") == joined[0]), None)
+            session = next(
+                (s for s in plugin.sessions_cache if s.get("id") == joined[0]), None
+            )
             joined_text = _session_title(session) if session else joined[0][:8]
         elif joined:
             joined_text = f"{len(joined)} 个（操作时需显式选择/传 session_id）"
@@ -941,9 +943,7 @@ class SessionActionView(DhapiBaseView):
     def _sync_join_button(self):
         joined = self._is_joined()
         session = self.session_by_id(self.sid) or {}
-        flavor = str(
-            ((session.get("metadata") or {}).get("flavor") or "")
-        ).lower()
+        flavor = str((session.get("metadata") or {}).get("flavor") or "").lower()
         for item in self.children:
             custom_id = getattr(item, "custom_id", "")
             if custom_id == "dhapi:session:join_leave":
@@ -1223,7 +1223,7 @@ class SessionConfigView(DhapiBaseView):
         super().__init__(plugin, event)
         self.sid = sid
         session = self.session_by_id(sid) or {}
-        flavor = str(((session.get("metadata") or {}).get("flavor") or "")).lower()
+        flavor = str((session.get("metadata") or {}).get("flavor") or "").lower()
         self._is_codex = flavor == "codex"
         self.add_item(
             SessionConfigReasoningSelect(
@@ -1532,10 +1532,15 @@ class ApprovalView(DhapiBaseView):
             args = req.get("arguments") or {}
             if req.get("type") == "llm_tool":
                 tool = str(req.get("tool") or "")
+                source = (
+                    "已授权的 AstrBot cron 任务"
+                    if args.get("background_direct")
+                    else "当前 Discord 频道"
+                )
                 desc_lines.extend(
                     [
                         f"操作：**{formatters.format_llm_approval_tool(tool)}**",
-                        "来源：当前 Discord 频道",
+                        f"来源：{source}",
                         formatters.format_llm_approval_arguments(tool, args),
                     ]
                 )
@@ -1723,10 +1728,15 @@ class ApprovalResultView(DhapiBaseView):
         lines = [f"{result}：{self.message}", "", "本次处理的请求："]
         if req.get("type") == "llm_tool":
             tool_name = str(tool)
+            source = (
+                "已授权的 AstrBot cron 任务"
+                if args.get("background_direct")
+                else "当前 Discord 频道"
+            )
             lines.extend(
                 [
                     f"操作：**{formatters.format_llm_approval_tool(tool_name)}**",
-                    "来源：当前 Discord 频道",
+                    f"来源：{source}",
                     formatters.format_llm_approval_arguments(tool_name, args),
                 ]
             )

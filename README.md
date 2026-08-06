@@ -17,6 +17,7 @@ _✨ HAPI 远程 vibe coding 的 Discord 专用版 ✨_
 
 - **支持平台**：仅 Discord（`support_platforms: [discord]`）。
 - **不支持平台**：QQ、微信、Telegram、飞书等其他 AstrBot 平台不会启用 `/dhapi` 或 `dhapi_coding_*` 工具。
+- **受控后台例外**：可选为精确白名单的 AstrBot Scheduler/cron 任务开放 3 个按 `session_id` 直连工具；默认关闭，详见[后台会话直连说明](docs/2026-08-06-background-session-direct-mode.md)。
 - **AstrBot 版本**：建议 AstrBot **3.4+**（metadata 声明 `>=3.4.0`）。
 - **Python 版本**：**Python 3.10+**。
 - **Discord 适配依赖**：依赖 AstrBot 官方 Discord 适配器提供的 Discord SDK；插件代码使用 `discord.ui.View/Button/Select/Modal`，兼容 py-cord / discord.py 风格接口，不额外固定 Discord SDK 版本。
@@ -112,11 +113,11 @@ _✨ HAPI 远程 vibe coding 的 Discord 专用版 ✨_
 | 工具 | 说明 |
 |------|------|
 | `dhapi_coding_list_sessions(window="", path="", agent="", joined_only=false)` | 列出 session（支持窗口/路径/agent 过滤；`joined_only=true` 时仅列出当前窗口已加入的 session） |
-| `dhapi_coding_get_status(session_id="")` | 获取 session 状态 |
-| `dhapi_coding_message_history(rounds=1, session_id="")` | 查询历史消息 |
+| `dhapi_coding_get_status(session_id="")` | 获取 session 状态；受控 cron 后台模式必须填写完整 ID 或唯一前缀 |
+| `dhapi_coding_message_history(rounds=1, session_id="")` | 查询历史消息；受控 cron 后台模式必须填写完整 ID 或唯一前缀 |
 | `dhapi_coding_get_config_status` | 查看插件配置 |
 | `dhapi_coding_list_commands` | 列出可用操作（按主题分类） |
-| `dhapi_coding_send_message(message, session_id="")` | 向 session 发送消息（需审批） |
+| `dhapi_coding_send_message(message, session_id="")` | 向 session 发送消息（需审批；受控 cron 会回原绑定 Discord 窗口审批） |
 | `dhapi_coding_join_session(session_id)` | 在当前 Discord 窗口加入 session 订阅（需审批） |
 | `dhapi_coding_leave_session(session_id="")` | 从当前 Discord 窗口退出 session 订阅（需审批） |
 | `dhapi_coding_create_session` | 创建新 session（需审批） |
@@ -128,6 +129,18 @@ _✨ HAPI 远程 vibe coding 的 Discord 专用版 ✨_
 `session_id` 不传时只是便捷糖：只有当前 Discord 窗口刚好加入了 1 个 session 才会自动使用它。为避免 LLM 长期记忆中的旧完整 UUID 串到旧 session，`send/status/history/stop/archive/delete/leave` 只会在**当前窗口已加入的 session** 内解析显式参数；短 ID / 前缀 / 序号也只在当前窗口 joined 列表内生效。未加入时请先 `dhapi_coding_list_sessions` + `dhapi_coding_join_session(session_id)`，或创建新 session 后省略 `session_id`。
 
 操作类工具的审批入口与文本流分离：LLM 工具发起操作时会在当前 Discord 窗口发送 **Embed + 原生按钮**，可直接点击“批准 / 拒绝 / 打开审批面板”，也可进入 `/dhapi` 审批页处理。
+
+### 受控 Scheduler/cron 后台模式
+
+AstrBot Scheduler/cron 没有 Discord MessageEvent 上下文时，默认不会看到或调用 DHAPI 工具。管理员可显式开启后台模式，并把**精确的 Scheduler `job_id`** 加入白名单；该任务随后仅能调用 `get_status`、`message_history`、`send_message` 三个工具。
+
+- 后台调用必须提供完整 `session_id` 或唯一前缀，不支持空值、序号、默认 session 或全局搜索。
+- 目标必须已持久化绑定到仍在线的 Discord 窗口。无绑定、失效绑定或前缀歧义会拒绝，绝不会回退到默认频道。
+- 非 yolo 的续派会只向该 session 持久化 join 顺序中的第一个仍在线 Discord 窗口发送审批卡；所有者可在卡片或 `/dhapi` 审批页处理。
+- 无卡直发必须由单独的 yolo 或全局自动审批开关明确允许，且依旧要求 cron 白名单和在线绑定。
+- `stop/archive/delete/create/join/leave/配置变更` 等危险或改变绑定的操作不支持后台模式。
+
+完整的安全边界、配置与部署步骤见[受控 cron 后台会话直连](docs/2026-08-06-background-session-direct-mode.md)。
 
 ---
 
@@ -167,8 +180,14 @@ LLM 工具审批通知会优先发送 Discord Embed，并附带原生 `discord.u
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
 | `auto_approve_enabled` | 自动审批开关：开启后 24 小时生效，自动批准非交互式权限请求 | 关闭 |
+| `background_direct_enabled` | 开启受控 cron 按 session_id 直连；没有白名单仍全部拒绝 | 关闭 |
+| `background_allowed_cron_job_ids` | 允许后台直连的 Scheduler 精确 `job_id` 列表 | 空列表 |
+| `background_direct_allow_yolo_send` | 已确认 `permissionMode=yolo` 时允许受控 cron 直接续派 | 关闭 |
+| `background_direct_allow_global_auto_approve_send` | 已开启全局自动审批时允许受控 cron 直接续派 | 关闭 |
 
 > 自动审批不再使用开始/结束时间窗口；开启就是 24 小时生效。需要用户回答的 AskUserQuestion 类请求仍保留在审批面板中处理。
+
+> 后台直连的两个“直接续派”开关不会自动随 `auto_approve_enabled` 或 session yolo 状态生效，必须另外开启；请只对已审查的 Scheduler `job_id` 使用。
 
 
 后端连接、SSE 推送级别、绑定优先级等行为与上游 [hapi_connector](https://github.com/LiJinHao999/astrbot_plugin_hapi_connector) 完全一致，详细原理参考上游文档。
