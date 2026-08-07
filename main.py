@@ -88,7 +88,7 @@ async def _cancel_stale_sse_tasks():
     "astrbot_plugin_hapi_discord_connector",
     "SGSxingchen",
     "HAPI 远程 coding 的 Discord 专用版：/dhapi 原生交互与 session 管理",
-    "2.1.0",
+    "2.1.1",
 )
 class HapiDiscordConnectorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
@@ -546,6 +546,7 @@ class HapiDiscordConnectorPlugin(Star):
         """刷新 HAPI session 缓存。"""
         try:
             self.sessions_cache[:] = await session_ops.fetch_sessions(self.client)
+            await self.sse_listener.reconcile_hub_pending()
         except Exception as e:
             logger.warning("刷新 session 列表失败: %s", e)
             raise

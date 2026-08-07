@@ -174,6 +174,10 @@ LLM 工具审批通知会优先发送 Discord Embed，并附带原生 `discord.u
 |--------|------|--------|
 | `output_level` | SSE 推送级别：`silence` / `simple` / `summary` / `detail` | simple |
 | `summary_msg_count` | summary 级别显示的 agent 消息条数 | 5 |
+| `remind_pending` | 对仍处于 active 状态且经 HAPI 详情确认存在的原生权限请求发送超时提醒 | 开启 |
+| `remind_interval` | 同一待审批集合的提醒最小间隔（秒）；集合新增或变化会重新计时 | 180 |
+
+> 提醒发送前会重新核验 HAPI 会话详情。已批准、已拒绝、不存在、失活或关闭会话中的旧请求会从插件缓存清理，不会再作为“待审批”提醒；本地 LLM 工具审批卡独立处理，不计入 HAPI 权限提醒。
 
 ### 自动审批
 

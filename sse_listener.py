@@ -59,6 +59,9 @@ class SSEListener:
         self._remind_task: asyncio.Task | None = None
         self._remind_enabled: bool = False
         self._remind_interval: int = 180
+        self._last_reminder_signature: tuple[tuple[str, str], ...] = ()
+        self._last_reminder_at: float = 0.0
+        self._auto_approved_pending: set[tuple[str, str]] = set()
         self._auto_approve_enabled: bool = False
         self._summary_msg_count: int = 5
         # {session_id: seq}，记录已触发通知的消息序号，防止重复
@@ -69,8 +72,6 @@ class SSEListener:
         self._compaction_completed_seqs: dict[str, int] = {}
         # {session_id: monotonic time}，用户拒绝 compact 后短期不再弹同一审批。
         self._compact_denied_until: dict[str, float] = {}
-        # {session_id: monotonic time}，compact reminder 节流。
-        self._compact_remind_last: dict[str, float] = {}
         # {session_id: seq}，记录已发送“任务完成”通知时的 lastSeq，防止状态抖动重复提醒
         self._completion_notified_seqs: dict[str, int] = {}
         # {session_id: [text, ...]}，短暂排队权限类通知，先补普通消息再发送
@@ -159,19 +160,19 @@ class SSEListener:
         self._remind_interval = remind_interval
         self._auto_approve_enabled = auto_approve_enabled
         self._max_reconnect = max_reconnect_attempts
-        self._hibernate_notified = False
-        self._debounce_sids: set[str] = set()
-        self._debounce_task: asyncio.Task | None = None
-        self._completion_sids: dict[str, int] = {}
-        self._completion_task: asyncio.Task | None = None
-        self._compact_check_sids: set[str] = set()
-        self._compact_check_task: asyncio.Task | None = None
-        self._queued_request_notifications = {}
-        self._request_notify_sids = set()
-        self._request_notify_task = None
         if self._task and not self._task.done():
             logger.info("SSE 监听已在运行，跳过重复启动")
             return
+        self._hibernate_notified = False
+        self._debounce_sids = set()
+        self._debounce_task = None
+        self._completion_sids = {}
+        self._completion_task = None
+        self._compact_check_sids = set()
+        self._compact_check_task = None
+        self._queued_request_notifications = {}
+        self._request_notify_sids = set()
+        self._request_notify_task = None
         self._task = asyncio.create_task(self._listen_loop())
 
     async def stop(self):
@@ -191,6 +192,8 @@ class SSEListener:
                     await task
                 except asyncio.CancelledError:
                     pass
+                except Exception as exc:
+                    logger.warning("停止后台任务时发生异常: %s", exc)
         self._task = None
         self._remind_task = None
         self._debounce_task = None
@@ -202,6 +205,9 @@ class SSEListener:
         self._compact_check_sids.clear()
         self._queued_request_notifications = {}
         self._request_notify_sids.clear()
+        self._last_reminder_signature = ()
+        self._last_reminder_at = 0.0
+        self._auto_approved_pending.clear()
 
     def wake_up(self):
         """唤醒休眠的监听器（重置失败计数并重启任务）"""
@@ -226,6 +232,213 @@ class SSEListener:
                 req_copy.pop("future", None)
                 result[sid][rid] = req_copy
         return result
+
+    @staticmethod
+    def _is_local_pending_request(rid: str, req: dict) -> bool:
+        """Return whether a pending entry is managed locally instead of by HAPI."""
+        return (
+            rid == "__compact__"
+            or req.get("type") == "llm_tool"
+            or req.get("_dhapi_pending_source") == "local"
+        )
+
+    def _hub_pending_snapshot(self) -> dict[str, dict]:
+        """Return only actionable HAPI permission requests from the local snapshot."""
+        result: dict[str, dict] = {}
+        for sid, reqs in self.pending.items():
+            if not isinstance(reqs, dict):
+                continue
+            hub_reqs = {
+                str(rid): req.copy()
+                for rid, req in reqs.items()
+                if isinstance(req, dict)
+                and not self._is_local_pending_request(str(rid), req)
+            }
+            if hub_reqs:
+                result[str(sid)] = hub_reqs
+        return result
+
+    async def _replace_hub_pending(
+        self, sid: str, requests_data: dict
+    ) -> list[tuple[str, dict]]:
+        """Replace one session's HAPI pending entries while preserving local entries.
+
+        Args:
+            sid: HAPI session ID.
+            requests_data: Authoritative HAPI request map from a session detail or SSE.
+
+        Returns:
+            Newly observed HAPI requests keyed by their stable request ID.
+        """
+        normalized = {
+            str(rid): dict(req)
+            for rid, req in (requests_data or {}).items()
+            if isinstance(req, dict)
+        }
+        async with self._lock:
+            current = self.pending.get(sid, {})
+            if not isinstance(current, dict):
+                current = {}
+            local = {
+                str(rid): req
+                for rid, req in current.items()
+                if isinstance(req, dict)
+                and self._is_local_pending_request(str(rid), req)
+            }
+            old_hub = {
+                str(rid): req
+                for rid, req in current.items()
+                if isinstance(req, dict)
+                and not self._is_local_pending_request(str(rid), req)
+            }
+
+            for rid, req in old_hub.items():
+                if rid not in normalized:
+                    self.free_index(int(req.get("index") or 0))
+
+            self._auto_approved_pending = {
+                key
+                for key in self._auto_approved_pending
+                if key[0] != sid or key[1] in normalized
+            }
+            hub: dict[str, dict] = {}
+            new_requests: list[tuple[str, dict]] = []
+            for rid, raw_req in normalized.items():
+                if (sid, rid) in self._auto_approved_pending:
+                    continue
+                previous = old_hub.get(rid)
+                req = dict(raw_req)
+                req["_dhapi_pending_source"] = "hub"
+                if previous and int(previous.get("index") or 0) > 0:
+                    req["index"] = int(previous["index"])
+                else:
+                    req["index"] = self.allocate_index()
+                    new_requests.append((rid, req))
+                hub[rid] = req
+
+            merged = {**local, **hub}
+            if merged:
+                self.pending[sid] = merged
+            else:
+                self.pending.pop(sid, None)
+            return new_requests
+
+    async def _clear_hub_pending(
+        self,
+        sid: str,
+        *,
+        remember_auto_approved: bool = False,
+        clear_compact: bool = False,
+    ):
+        """Remove HAPI-backed entries and optionally a compact request for a session."""
+        async with self._lock:
+            current = self.pending.get(sid, {})
+            if not isinstance(current, dict):
+                current = {}
+            retained = {}
+            for rid, req in current.items():
+                if not isinstance(req, dict):
+                    continue
+                rid = str(rid)
+                if self._is_local_pending_request(rid, req) and not (
+                    clear_compact and rid == "__compact__"
+                ):
+                    retained[rid] = req
+                    continue
+                self.free_index(int(req.get("index") or 0))
+                if remember_auto_approved:
+                    self._auto_approved_pending.add((sid, rid))
+            if retained:
+                self.pending[sid] = retained
+            else:
+                self.pending.pop(sid, None)
+            if not remember_auto_approved:
+                self._auto_approved_pending = {
+                    key for key in self._auto_approved_pending if key[0] != sid
+                }
+
+    async def _remove_hub_pending(
+        self, sid: str, rid: str, *, remember_auto_approved: bool = False
+    ):
+        """Remove one HAPI-backed request after a terminal result."""
+        async with self._lock:
+            current = self.pending.get(sid, {})
+            req = current.get(rid) if isinstance(current, dict) else None
+            if isinstance(req, dict) and not self._is_local_pending_request(rid, req):
+                self.free_index(int(req.get("index") or 0))
+                current.pop(rid, None)
+                if not current:
+                    self.pending.pop(sid, None)
+            if remember_auto_approved:
+                self._auto_approved_pending.add((sid, rid))
+
+    async def reconcile_hub_pending(
+        self, session_ids: set[str] | None = None
+    ) -> set[str]:
+        """Reconcile locally cached HAPI requests with authoritative session details.
+
+        Args:
+            session_ids: Optional HAPI session IDs to check. When omitted, checks
+                cached HAPI requests and active summaries that report pending work.
+
+        Returns:
+            Session IDs whose authoritative state was obtained or confirmed absent.
+        """
+        if session_ids is None:
+            async with self._lock:
+                session_ids = set(self._hub_pending_snapshot())
+            for session in self.sessions_cache:
+                sid = str(session.get("id") or "")
+                pending_count = session.get(
+                    "pendingRequestsCount", session.get("pendingRequests", 0)
+                )
+                if session.get("active") is False:
+                    if pending_count:
+                        session["pendingRequestsCount"] = 0
+                        if "pendingRequests" in session:
+                            session["pendingRequests"] = 0
+                    continue
+                try:
+                    has_pending = int(pending_count or 0) > 0
+                except (TypeError, ValueError):
+                    has_pending = False
+                if sid and has_pending:
+                    session_ids.add(sid)
+
+        checked: set[str] = set()
+        for sid in sorted({str(value) for value in session_ids if value}):
+            try:
+                detail = await session_ops.fetch_session_detail(self.client, sid)
+            except Exception as exc:
+                if "404" in str(exc):
+                    await self._clear_hub_pending(sid, clear_compact=True)
+                    checked.add(sid)
+                else:
+                    logger.warning("待审批权威校验失败 (sid=%s): %s", sid[:8], exc)
+                continue
+
+            if detail.get("active") is not True:
+                await self._clear_hub_pending(sid, clear_compact=True)
+                self._update_session_cache(
+                    sid,
+                    {
+                        "active": False,
+                        "thinking": False,
+                        "pendingRequestsCount": 0,
+                    },
+                )
+                checked.add(sid)
+                continue
+
+            agent_state = detail.get("agentState") or {}
+            requests_data = (
+                agent_state.get("requests") if isinstance(agent_state, dict) else {}
+            )
+            await self._replace_hub_pending(
+                sid, requests_data if isinstance(requests_data, dict) else {}
+            )
+            checked.add(sid)
+        return checked
 
     async def _listen_loop(self):
         """主循环：SSE 监听 + 指数退避重连"""
@@ -359,9 +572,7 @@ class SSEListener:
             old_state = self.session_states.get(sid, {})
 
             is_active = (
-                data.get("active")
-                if "active" in data
-                else old_state.get("active", False)
+                data.get("active") if "active" in data else old_state.get("active")
             )
             is_thinking = (
                 data.get("thinking")
@@ -381,48 +592,30 @@ class SSEListener:
                 "lastSeq": old_seq,
             }
 
-        # 处理权限请求
+        # Only an active session can own actionable HAPI permission requests.
+        # HAPI can retain requests in an inactive session after a runner restart.
         new_requests: list[tuple[str, dict]] = []
-        if agent_state:
+        if is_active is False:
+            await self._clear_hub_pending(sid, clear_compact=True)
+        elif isinstance(agent_state, dict):
             requests_data = agent_state.get("requests") or {}
-            async with self._lock:
-                old_reqs = self.pending.get(sid, {})
-                new_requests = [
-                    (rid, req)
-                    for rid, req in requests_data.items()
-                    if rid not in old_reqs
-                ]
-                # 检测被删除的请求，回收序号
-                removed_rids = set(old_reqs.keys()) - set(requests_data.keys())
-                for rid in removed_rids:
-                    req = old_reqs[rid]
-                    index = req.get("index", 0)
-                    if index > 0:
-                        self.free_index(index)
-
-                # 为新请求分配序号
-                for rid, req in new_requests:
-                    if "index" not in req:
-                        req["index"] = self.allocate_index()
-
-                if requests_data:
-                    self.pending[sid] = requests_data
-                elif sid in self.pending:
-                    del self.pending[sid]
+            new_requests = await self._replace_hub_pending(
+                sid, requests_data if isinstance(requests_data, dict) else {}
+            )
 
             # 有新的权限请求 -> 推送提醒（或全天自动批准）
             queued_notifications: list[str] = []
             for rid, req in new_requests:
                 label = session_label_short(sid, self.sessions_cache)
-                async with self._lock:
-                    total = sum(len(r) for r in self.pending.values())
-                    session_total = len(self.pending.get(sid, {}))
-
                 index = req.get("index", 0)
 
                 if self._auto_approve_enabled and not is_question_request(req):
                     # 自动审批开启时：全天自动批准非 question 请求
                     ok, _ = await session_ops.approve_permission(self.client, sid, rid)
+                    if ok:
+                        await self._remove_hub_pending(
+                            sid, rid, remember_auto_approved=True
+                        )
                     tool = req.get("tool", "?")
                     result_mark = "✓" if ok else "✗"
                     notify_msg = (
@@ -430,6 +623,10 @@ class SSEListener:
                     )
                     queued_notifications.append(notify_msg)
                 else:
+                    async with self._lock:
+                        pending_snapshot = self._hub_pending_snapshot()
+                        total = sum(len(items) for items in pending_snapshot.values())
+                        session_total = len(pending_snapshot.get(sid, {}))
                     if is_question_request(req):
                         msg = format_question_notification(
                             req, label, total, session_total, index
@@ -444,14 +641,16 @@ class SSEListener:
             self._queue_request_notifications(sid, queued_notifications)
 
         # 有新请求 → 启动一次性提醒倒计时（如未启动）
-        if new_requests and self._remind_enabled:
+        async with self._lock:
+            has_hub_pending = bool(self._hub_pending_snapshot())
+        if new_requests and has_hub_pending and self._remind_enabled:
             if self._remind_task is None or self._remind_task.done():
                 self._remind_task = asyncio.create_task(self._remind_once())
 
-        # pending 已全部清空 → 取消提醒倒计时
+        # HAPI pending 已全部清空 → 取消提醒倒计时
         async with self._lock:
-            pending_empty = not self.pending
-        if pending_empty and self._remind_task and not self._remind_task.done():
+            hub_pending_empty = not self._hub_pending_snapshot()
+        if hub_pending_empty and self._remind_task and not self._remind_task.done():
             self._remind_task.cancel()
 
         # === 输出级别处理 ===
@@ -748,6 +947,7 @@ class SSEListener:
                         compact_req = {
                             "tool": "__compact__",
                             "arguments": {},
+                            "_dhapi_pending_source": "local",
                             "index": self.allocate_index(),
                         }
                         self.pending.setdefault(sid, {})["__compact__"] = compact_req
@@ -1001,35 +1201,49 @@ class SSEListener:
             return False
 
     async def _remind_once(self):
-        """倒计时结束后，若仍有待审批请求则发一次提醒"""
+        """Send one throttled reminder after validating HAPI's current state."""
         try:
             await asyncio.sleep(self._remind_interval)
         except asyncio.CancelledError:
             return
         if not self._active():
             return
+
+        checked_sessions = await self.reconcile_hub_pending()
+        if not self._active():
+            return
         async with self._lock:
-            if not self.pending:
+            all_pending_snapshot = self._hub_pending_snapshot()
+            if not all_pending_snapshot:
+                self._last_reminder_signature = ()
+                self._last_reminder_at = 0.0
                 return
-            pending_snapshot = self.get_all_pending()
-
-        total = sum(len(r) for r in pending_snapshot.values())
-        now = time.monotonic()
-        for sid, reqs in pending_snapshot.items():
-            non_compact_reqs = {
-                rid: req for rid, req in reqs.items() if rid != "__compact__"
+            pending_snapshot = {
+                sid: reqs
+                for sid, reqs in all_pending_snapshot.items()
+                if sid in checked_sessions
             }
-            compact_only = "__compact__" in reqs and not non_compact_reqs
-            if compact_only:
-                last = self._compact_remind_last.get(sid, 0)
-                if now - last < 60:
-                    continue
-                self._compact_remind_last[sid] = now
-                display_reqs = reqs
-            else:
-                display_reqs = reqs
+            if not pending_snapshot:
+                logger.warning("跳过未经权威确认的待审批提醒")
+                return
+            signature = tuple(
+                sorted(
+                    (sid, rid) for sid, reqs in pending_snapshot.items() for rid in reqs
+                )
+            )
+            now = time.monotonic()
+            if (
+                signature == self._last_reminder_signature
+                and now - self._last_reminder_at < max(1, self._remind_interval)
+            ):
+                logger.info("跳过未变化的待审批提醒: requests=%d", len(signature))
+                return
+            self._last_reminder_signature = signature
+            self._last_reminder_at = now
 
-            count = len(display_reqs)
+        total = sum(len(reqs) for reqs in pending_snapshot.values())
+        for sid, reqs in pending_snapshot.items():
+            count = len(reqs)
             if count == 0:
                 continue
             label = session_label_short(sid, self.sessions_cache)
@@ -1073,27 +1287,10 @@ class SSEListener:
         await self.notify_callback(text, session_id)
 
     async def load_existing_pending(self):
-        """启动时从已有 session 加载待审批请求"""
-        for s in self.sessions_cache:
-            sid = s.get("id", "")
-            pending_count = s.get("pendingRequestsCount", 0)
-            if not sid or not pending_count:
-                continue
-            try:
-                detail = await session_ops.fetch_session_detail(self.client, sid)
-                agent_state = detail.get("agentState") or {}
-                requests_data = agent_state.get("requests") or {}
-                if requests_data:
-                    async with self._lock:
-                        # 为已有请求分配序号
-                        for rid, req in requests_data.items():
-                            if "index" not in req:
-                                req["index"] = self.allocate_index()
-                        self.pending[sid] = requests_data
-                    logger.info(
-                        "加载 session %s 的 %d 个待审批请求",
-                        sid[:8],
-                        len(requests_data),
-                    )
-            except Exception as e:
-                logger.warning("加载 session %s 待审批失败: %s", sid[:8], e)
+        """Load actionable HAPI pending requests after checking session details."""
+        before = self._hub_pending_snapshot()
+        await self.reconcile_hub_pending()
+        after = self._hub_pending_snapshot()
+        for sid, reqs in after.items():
+            if sid not in before and reqs:
+                logger.info("加载 session %s 的 %d 个待审批请求", sid[:8], len(reqs))

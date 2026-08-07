@@ -182,6 +182,7 @@ class PendingManager:
             "tool": tool_name,
             "arguments": args,
             "type": "llm_tool",
+            "_dhapi_pending_source": "local",
             "future": future,
             "index": index,
         }

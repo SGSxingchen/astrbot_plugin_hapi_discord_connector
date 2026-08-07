@@ -15,7 +15,10 @@ async def fetch_sessions(client: AsyncHapiClient) -> list[dict]:
 async def fetch_session_detail(client: AsyncHapiClient, sid: str) -> dict:
     """获取单个 session 详情"""
     resp = await client.get(f"/api/sessions/{sid}")
-    resp.raise_for_status()
+    if resp.status >= 400:
+        body = await resp.text()
+        resp.release()
+        raise RuntimeError(f"HTTP {resp.status}: {body[:200]}")
     data = await resp.json()
     resp.release()
     return data.get("session", data)

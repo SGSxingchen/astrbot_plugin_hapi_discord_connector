@@ -1573,6 +1573,10 @@ class ApprovalView(DhapiBaseView):
         ok, msg = await session_ops.approve_permission(self.plugin.client, sid, rid)
         if ok:
             self.plugin.pending_mgr.remove_entry(sid, rid)
+        else:
+            await self.plugin.sse_listener.reconcile_hub_pending({sid})
+            if rid not in self.plugin.sse_listener.pending.get(sid, {}):
+                return True, "请求已处理或不存在，已清理本地待审批缓存"
         return ok, msg
 
     async def _deny_item(self, sid: str, rid: str, req: dict) -> tuple[bool, str]:
@@ -1591,6 +1595,10 @@ class ApprovalView(DhapiBaseView):
         ok, msg = await session_ops.deny_permission(self.plugin.client, sid, rid)
         if ok:
             self.plugin.pending_mgr.remove_entry(sid, rid)
+        else:
+            await self.plugin.sse_listener.reconcile_hub_pending({sid})
+            if rid not in self.plugin.sse_listener.pending.get(sid, {}):
+                return True, "请求已处理或不存在，已清理本地待审批缓存"
         return ok, msg
 
     @discord.ui.button(

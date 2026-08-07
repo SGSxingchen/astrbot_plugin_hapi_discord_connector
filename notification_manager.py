@@ -393,6 +393,8 @@ class NotificationManager:
     @staticmethod
     def _event_style(text: str, brand_color: int) -> tuple[str, int]:
         lower = text.lower()
+        if text.lstrip().startswith("⏰ 提醒："):
+            return "reminder", 0xE74C3C
         if "待审批" in text or "权限请求" in text or "问题请求" in text:
             return "approval", 0xE74C3C
         if "任务完成" in text or "completed" in lower or "完成" in text:
@@ -409,6 +411,8 @@ class NotificationManager:
     def _title_for(
         self, kind: str, text: str, short_sid: str, flavor: str, summary: str
     ) -> str:
+        if kind == "reminder":
+            return "待审批提醒"
         if kind == "approval":
             return f"待审批 - {self._extract_tool(text)}"
         if kind == "done":

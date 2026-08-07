@@ -1,6 +1,7 @@
 """LLM 工具集成 - 为 LLM 提供 HAPI Coding Session 交互能力"""
 
 import asyncio
+import json
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
@@ -1246,6 +1247,21 @@ enable_agent_final_trigger (agent final 触发 AstrBot 主链): {"开启" if age
             self.plugin.config["enable_agent_final_trigger"] = bool_val
             self.plugin.config.save_config()
             return f"✅ 已设置 {config_name} = {bool_val}"
+        elif config_name == "background_allowed_cron_job_ids":
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                return "background_allowed_cron_job_ids 必须是 JSON 字符串数组"
+            if not isinstance(parsed, list) or not all(
+                isinstance(job_id, str) and job_id.strip() for job_id in parsed
+            ):
+                return (
+                    "background_allowed_cron_job_ids 必须是非空字符串组成的 JSON 数组"
+                )
+            job_ids = list(dict.fromkeys(job_id.strip() for job_id in parsed))
+            self.plugin.config["background_allowed_cron_job_ids"] = job_ids
+            self.plugin.config.save_config()
+            return f"✅ 已设置 {config_name} = {job_ids}"
         else:
             return f"不支持的配置项: {config_name}，请先调用 dhapi_coding_get_config_status 查看可用配置"
 
